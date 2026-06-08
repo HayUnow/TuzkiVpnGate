@@ -1600,7 +1600,7 @@ class Handler(BaseHTTPRequestHandler):
                 test_multiple_nodes(payload.get("ids", []))
                 self.send_json({"ok": True})
             else: self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-        except Exception as exc: self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        except Exception as exc: self.send_json({"ok": False, "error": "Internal Server Error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
 class Tee:
     def __init__(self, file_path: str):
