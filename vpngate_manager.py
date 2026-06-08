@@ -148,6 +148,19 @@ def safe_enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             print(f"[API 风控防范] 忽略该次 IP 属性检测报错: {e}", flush=True)
         _last_enrich_time = time.time()
 
+def cleanup_memory_pools():
+    now = time.time()
+    with lock:
+        # 清理过期 Session
+        expired_tokens = [k for k, v in active_sessions.items() if v["expires"] < now]
+        for k in expired_tokens:
+            del active_sessions[k]
+        
+        # 清理已过锁定期的失败记录
+        expired_locks = [k for k, v in failed_logins.items() if v["lock_until"] > 0 and now >= v["lock_until"]]
+        for k in expired_locks:
+            del failed_logins[k]
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     CONFIG_DIR.mkdir(exist_ok=True)
@@ -1344,8 +1357,11 @@ def background_proxy_checker() -> None:
             if not res["ok"] and active_openvpn_node_id:
                 if load_ui_config().get("routing_mode") != "fixed_ip":
                     auto_switch_node()
+            # 【安全修正】将其放入 try 块内，即使清理失败也不会导致健康检测线程崩溃        
+            cleanup_memory_pools()
         except Exception: pass
-        time.sleep(180) 
+        time.sleep(180)
+         
 
 def active_node_pinger() -> None:
     while True:
@@ -1444,7 +1460,7 @@ class Handler(BaseHTTPRequestHandler):
             
             if path == "/api/login":
                 # 获取真实的客户端 IP (防代理伪装)
-                client_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
+                client_ip = self.client_address[0]
                 username_input = payload.get("username", "")
                 password_input = payload.get("password", "")
                 
