@@ -147,7 +147,7 @@ def generate_random_password() -> str:
     
     # 补齐剩下的 8 位 (总共 12 位)
     all_chars = lower + upper + digits + special
-    pwd += random.choices(all_chars, k=8)
+    pwd += random.choices(all_chars, k=16)
     
     # 打乱顺序，防止密码前四位规律性太强
     random.shuffle(pwd)
@@ -771,7 +771,7 @@ if [ ! -f "$AUTH_FILE" ]; then
     
     UI_PORT=18658
     SECRET_PATH=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
-    UI_PASSWORD=$(python3 -c "import random, string; lower = string.ascii_lowercase; upper = string.ascii_uppercase; digits = string.digits; special = '!@#$%^&+-/*'; pwd = [random.choice(lower), random.choice(upper), random.choice(digits), random.choice(special)] + random.choices(lower + upper + digits + special, k=8); random.shuffle(pwd); print(''.join(pwd))")
+    UI_PASSWORD=$(python3 -c "import random, string; lower = string.ascii_lowercase; upper = string.ascii_uppercase; digits = string.digits; special = '!@#$%^&+-/*'; pwd = [random.choice(lower), random.choice(upper), random.choice(digits), random.choice(special)] + random.choices(lower + upper + digits + special, k=16); random.shuffle(pwd); print(''.join(pwd))")
     UI_USERNAME=$(python3 -c "import random, string; c=string.ascii_letters+string.digits; print(next(u for _ in iter(int,1) for u in [''.join(random.choices(c, k=12))] if u[0].isalpha() and any(x.islower() for x in u) and any(x.isupper() for x in u) and any(x.isdigit() for x in u)))")
 
     if [[ "$is_custom" =~ ^[Yy]$ ]]; then
@@ -836,7 +836,7 @@ elif command -v rc-service >/dev/null 2>&1; then
     rc-service aimilivpn restart || true
 fi
 
-echo -e "\n正在等待 AimiliVPN 首次获取节点并建立加密通道 (此过程可能需要 5-60 秒)..."
+echo -e "\n正在等待 AimiliVPN 首次获取节点并建立加密通道 (此过程可能需要 1-3 分钟，请耐心等待)..."
 ACTIVE_ID=""
 for i in {1..90}; do
     if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then

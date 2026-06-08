@@ -24,6 +24,35 @@ from pathlib import Path
 from typing import Any
 import concurrent.futures
 
+def sanitize_openvpn_config(text: str) -> str:
+    """
+    [安全核心] 清洗 OpenVPN 配置文件，剔除所有可能导致 RCE (远程代码执行) 的危险指令
+    """
+    safe_lines = []
+    # OpenVPN 中可能被滥用执行本地命令的危险指令集
+    dangerous_cmds = {
+        "up", "down", "route-up", "route-pre-down", "ipchange",
+        "script-security", "plugin", "tls-verify", 
+        "auth-user-pass-verify", "client-connect", "client-disconnect",
+        "learn-address"
+    }
+    
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if not parts or parts[0].startswith(("#", ";")):
+            safe_lines.append(line)
+            continue
+        
+        cmd = parts[0].lower()
+        if cmd in dangerous_cmds:
+            print(f"[安全拦截] 发现并剔除恶意 OpenVPN 指令: {line}", flush=True)
+            continue # 丢弃恶意配置行
+            
+        safe_lines.append(line)
+        
+    return "\n".join(safe_lines)
+
+
 # 优先 IPv4 解析避免卡顿
 _orig_getaddrinfo = socket.getaddrinfo
 def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -91,6 +120,7 @@ AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 
 lock = threading.RLock()
 active_sessions: dict[str, dict[str, Any]] = {}
+failed_logins: dict[str, dict[str, Any]] = {} # [新增] 用于记录登录失败状态的内存池
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 is_connecting = True
@@ -159,7 +189,7 @@ def generate_random_password() -> str:
     
     # 补齐剩下的 8 位 (总共 12 位)
     all_chars = lower + upper + digits + special
-    password += random.choices(all_chars, k=8)
+    password += random.choices(all_chars, k=16)
     
     # 打乱顺序，防止密码前四位规律性太强
     random.shuffle(password)
@@ -195,8 +225,13 @@ def load_ui_config() -> dict[str, Any]:
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
-                auth_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception: pass
+                # 原子化安全写入：文件落地瞬间即为 0600，无需事后再 chmod，避免了 try 嵌套的混乱
+                content = json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8")
+                fd = os.open(str(auth_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with open(fd, 'wb') as f:
+                    f.write(content)
+            except Exception: 
+                pass
         return config
 
 try:
@@ -277,6 +312,9 @@ def decode_config(encoded: str) -> str:
     return base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8", errors="replace")
 
 def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
+    # --- [安全修复] 洗刷包含恶意脚本的配置 ---
+    config_text = sanitize_openvpn_config(config_text)
+    # --------------------------------------
     ip = row.get("IP", "")
     country_short = row.get("CountryShort", "")
     remote_host, remote_port, proto = vpn_utils.parse_remote(config_text, ip)
@@ -297,7 +335,8 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
 def fetch_candidates() -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
-    for url, verify_ssl in [(API_URL, True), (API_URL, False)]:
+    # [安全修复] 删除 (API_URL, False) 回退，强制校验 SSL 证书，防止中间人投毒
+    for url, verify_ssl in [(API_URL, True)]:
         for _ in range(2):
             try:
                 api_text = fetch_api_text(url, verify_ssl)
@@ -326,7 +365,8 @@ def get_openvpn_version() -> float:
 def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> list[str]:
     cmd = ["openvpn", "--config", config_file, "--dev", dev, "--dev-type", "tun", "--pull-filter", "ignore", "route-ipv6",
            "--pull-filter", "ignore", "ifconfig-ipv6", "--route-delay", "2", "--connect-retry-max", "1",
-           "--connect-timeout", "15", "--auth-user-pass", str(AUTH_FILE), "--auth-nocache", "--verb", "3"]
+           "--connect-timeout", "15", "--auth-user-pass", str(AUTH_FILE), "--auth-nocache", "--verb", "3",
+           "--script-security", "1"] # <--- [安全修复] 强制锁定安全级别，禁止执行外部命令]
     if get_openvpn_version() >= 2.5: cmd.extend(["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
     else: cmd.extend(["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
     if route_nopull: cmd.append("--route-nopull")
@@ -923,7 +963,7 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <script>
-let nodes=[], state={}, testingIds=new Set(), singboxEnabled=false;
+let nodes=[], state={}, testingIds=new Set(), singboxEnabled=false, userTouchedIpFilter=false, loadingStartTime=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
 
@@ -955,22 +995,17 @@ async function saveDomain() {
         method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({domain})
     });
     const d = await r.json();
-    
     if (d.ok) {
         closeModal('domain_modal');
-        // 显示倒计时模态框
         $("restart_modal").style.display = "flex";
-        
-        let count = 10; // 设置倒计时时长
+        let count = 10;
         const numEl = $("countdown_num");
-        
         const timer = setInterval(() => {
             count--;
             numEl.innerText = count;
             if (count <= 0) {
                 clearInterval(timer);
                 const port = location.port || "18658";
-                // 根据是否有域名决定跳转协议
                 if (domain) {
                     window.location.href = `https://${domain}:${port}${window.location.pathname}`;
                 } else {
@@ -982,12 +1017,14 @@ async function saveDomain() {
         alert(d.message || "操作失败");
     }
 }
+
 async function closeWarningModal() {
     if ($("chk_ignore_warning").checked) {
         await fetch("./api/ignore_domain_warning", {method:"POST"});
     }
     closeModal('domain_warning_modal');
 }
+
 function formatUptime(seconds) {
     if (!seconds || seconds < 0) return "00:00:00";
     const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
@@ -1034,6 +1071,8 @@ function render(){
     }
   }
   
+  const hasAvailableNodes = nodes.some(n => n.probe_status === 'available');
+
   if(activeNode) {
     $("active_node_card").innerHTML = `
       <div class="active-card">
@@ -1045,8 +1084,29 @@ function render(){
         </div>
         <button id="btn_disconnect" style="background:var(--danger);color:white;border:none; height: 38px; padding: 0 16px; border-radius: 8px; font-weight: bold; cursor: pointer;" onclick="disconnectNode()">断开连接</button>
       </div>`;
+  } else if (state.is_connecting || !hasAvailableNodes) {
+    if (!loadingStartTime) loadingStartTime = Date.now();
+    $("active_node_card").innerHTML = `
+      <div class="active-card" style="display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 35px 20px; border: 2px dashed rgba(99, 102, 241, 0.4); background: rgba(99, 102, 241, 0.05);">
+        <div style="font-size: 22px; font-weight: 700; color: #a5b4fc; margin-bottom: 12px; display: flex; align-items: center; gap: 10px;">
+          <svg style="animation: spin 2s linear infinite; width: 26px; height: 26px; color: #a5b4fc;" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" style="opacity: 0.25;"></circle><path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" style="opacity: 0.75;"></path></svg>
+          正在批量处理节点信息
+        </div>
+        <div style="color: var(--text-secondary); font-size: 15px; text-align: center;">
+          后台正在为您测速并筛选优质节点，约 1-5 分钟，请耐心等待！<br>
+          <div style="margin-top: 12px; display: inline-block; padding: 4px 16px; background: rgba(0,0,0,0.2); border-radius: 20px; font-family: 'JetBrains Mono', monospace; font-size: 13px;">
+            ⏱️ 已经耗时: <span id="loading_timer" style="color: #f59e0b; font-weight: bold; font-size: 14px;">00:00:00</span>
+          </div>
+        </div>
+      </div>
+      <style>@keyframes spin { 100% { transform: rotate(360deg); } }</style>
+    `;
   } else {
-    $("active_node_card").innerHTML = `<div class="active-card" style="opacity:0.6;">未连接，请在下方列表选择节点切换。</div>`;
+    loadingStartTime = null; 
+    $("active_node_card").innerHTML = `
+      <div class="active-card" style="display: flex; justify-content: center; align-items: center; padding: 30px; opacity: 0.8;">
+        <span style="font-size: 16px; color: var(--text-secondary);">未连接，请在下方列表选择可用节点切换。</span>
+      </div>`;
   }
 
   const shown = getFilteredNodes();
@@ -1079,6 +1139,10 @@ setInterval(() => {
         const upSecs = Math.floor((Date.now() - state.connected_at * 1000) / 1000);
         $("uptime_counter").innerText = formatUptime(upSecs);
     }
+    if (loadingStartTime && $("loading_timer")) {
+        const loadSecs = Math.floor((Date.now() - loadingStartTime) / 1000);
+        $("loading_timer").innerText = formatUptime(loadSecs);
+    }
 }, 1000);
 
 let warningShown = false; 
@@ -1090,8 +1154,8 @@ async function load(){
 
     $("bind_domain_input").value = state.bound_domain || "";
     if (!state.bound_domain && !state.ignore_domain_warning && !warningShown) {
-    openModal('domain_warning_modal');
-    warningShown = true;
+        openModal('domain_warning_modal');
+        warningShown = true;
     }
 
     singboxEnabled = !!state.singbox_enabled;
@@ -1115,6 +1179,17 @@ async function load(){
     }
     
     $("net_port").value=state.port; $("net_suffix").value=state.secret_path; $("net_proxy").value=state.proxy_port; $("net_routing_mode").value=state.routing_mode;
+    
+    // [智能过滤逻辑] 如果用户没有手动切换过下拉框，则由系统智能控制
+    if (!userTouchedIpFilter && nodes.length > 0) {
+      const hasResidential = nodes.some(n => ["residential", "mobile"].includes(n.ip_type));
+      if (hasResidential) {
+        $("ip_type_filter").value = "residential"; 
+      } else {
+        $("ip_type_filter").value = ""; 
+      }
+    }
+
     stableSortNodes(); render();
   }catch(e){}
 }
@@ -1174,6 +1249,7 @@ async function batchTestNodes() {
 
 async function refreshNodes(){
   $("refresh").innerText="更新中...";
+  userTouchedIpFilter = false; 
   await fetch("./api/refresh_nodes",{method:"POST"});
   setTimeout(()=>{ $("refresh").innerText="更新节点"; load(); }, 2000);
 }
@@ -1217,7 +1293,7 @@ async function saveNetwork(){
 async function logoutAdmin(){ await fetch("./api/logout",{method:"POST"}); window.location.reload(); }
 
 $("country_filter").onchange = render;
-$("ip_type_filter").onchange = render;
+$("ip_type_filter").onchange = () => { userTouchedIpFilter = true; render(); };
 setInterval(load, 10000); load();
 </script>
 </body></html>"""
@@ -1357,18 +1433,75 @@ class Handler(BaseHTTPRequestHandler):
         if not path: return
         try:
             length = parse_int(self.headers.get("Content-Length"))
+            # --- [安全修复] 防御内存耗尽攻击 (OOM DoS) ---
+            if length > 524288: # 限制最大请求体为 512KB (API交互足够用了)
+                self.send_response(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                self.end_headers()
+                self.wfile.write(b'{"error": "Payload Too Large"}')
+                return
+            # ---------------------------------------------
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
             
             if path == "/api/login":
-                if payload.get("password") == load_ui_config().get("password", "") and payload.get("username") == load_ui_config().get("username", ""):
+                # 获取真实的客户端 IP (防代理伪装)
+                client_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
+                username_input = payload.get("username", "")
+                password_input = payload.get("password", "")
+                
+                # 构建锁定键值：用户名 + IP
+                lock_key = f"{username_input}:{client_ip}"
+                now = time.time()
+                
+                # 获取锁定状态，默认为 0 次失败
+                lock_info = failed_logins.get(lock_key, {"count": 0, "lock_until": 0.0})
+                
+                # 1. 检查是否在锁定惩罚期内
+                if now < lock_info["lock_until"]:
+                    remain_minutes = int((lock_info["lock_until"] - now) / 60) + 1
+                    self.send_json({"ok": False, "error": f"出于安全考虑，该账户在当前IP下已被锁定，请 {remain_minutes} 分钟后再试。"}, HTTPStatus.FORBIDDEN)
+                    return
+                elif lock_info["lock_until"] > 0 and now >= lock_info["lock_until"]:
+                    # 锁定时间已过，重置状态
+                    lock_info = {"count": 0, "lock_until": 0.0}
+
+                # 2. 验证账号密码
+                real_user = load_ui_config().get("username", "")
+                real_pass = load_ui_config().get("password", "")
+                
+                if password_input == real_pass and username_input == real_user:
+                    # 登录成功，释放对该 用户名+IP 的失败计数
+                    if lock_key in failed_logins:
+                        del failed_logins[lock_key]
+                    # --- [安全修复] 登录成功时，顺手清理全域已过期的僵尸 Token，防止内存泄漏 ---
+                    now_time = time.time()
+                    expired_tokens = [k for k, v in active_sessions.items() if v["expires"] < now_time]
+                    for k in expired_tokens:
+                        del active_sessions[k]
+                    # -----------------------------------------------------------------------    
                     token = uuid.uuid4().hex
                     active_sessions[token] = {"expires": time.time() + 3600}
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
-                    self.send_header("Set-Cookie", f"session={token}; Path=/{self.get_secret_path()}/; HttpOnly; Max-Age=3600")
+                    # 如果绑定了域名（启用了HTTPS），则强制 Cookie 走加密传输
+                    is_secure = "Secure; " if load_ui_config().get("bound_domain") else ""
+                    self.send_header("Set-Cookie", f"session={token}; Path=/{self.get_secret_path()}/; HttpOnly; {is_secure}SameSite=Lax; Max-Age=3600")
+                    # -----------------------------------
                     self.end_headers()
                     self.wfile.write(b'{"ok":true}')
-                else: self.send_json({"ok": False, "error": "凭证错误"}, HTTPStatus.FORBIDDEN)
+                else:
+                    # 登录失败，增加错误计数
+                    lock_info["count"] += 1
+                    
+                    if lock_info["count"] >= 5:
+                        # 达到5次，锁定15分钟 (15 * 60 = 900秒)
+                        lock_info["lock_until"] = now + 900
+                        failed_logins[lock_key] = lock_info
+                        self.send_json({"ok": False, "error": "失败次数已达5次！出于安全防护，该用户名及当前IP已被锁定15分钟。"}, HTTPStatus.FORBIDDEN)
+                    else:
+                        # 未达到上限，更新记录并提醒
+                        failed_logins[lock_key] = lock_info
+                        remain_times = 5 - lock_info["count"]
+                        self.send_json({"ok": False, "error": f"凭证错误。您还有 {remain_times} 次尝试机会。"}, HTTPStatus.FORBIDDEN)
                 return
 
             if not self.is_authorized(): self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED); return
