@@ -1,5 +1,5 @@
-# aimili-vpngate
-aimili-vpngate是一个借助vpngate.net让Linux用干净ip出站的代理工具。<br>
+# TuzkiVpnGate
+TuzkiVpnGate是一个借助vpngate.net让Linux用干净ip出站的代理工具。<br>
 
 上游仓库地址：https://github.com/baoweise-bot/aimili-vpngate<br>
 
