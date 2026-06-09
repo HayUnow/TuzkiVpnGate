@@ -15,6 +15,8 @@ TuzkiVpnGate是一个借助vpngate.net让Linux用干净ip出站的代理工具�
 
 5.其余细节优化。<br>
 
+6.使用方法：下载代码后，在vps上新建一个目录，然后将文件拖进去，cd 到对应目录，之后 bash install.sh 即可！<br>
+
 ======================以上所有修改均来自于谷歌的 “Gemini”  ======================
 
 ![AimiliVPN](aimili.png)
