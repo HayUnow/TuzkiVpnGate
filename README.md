@@ -1,6 +1,8 @@
 # TuzkiVpnGate
 TuzkiVpnGate是一个借助vpngate.net让Linux用干净ip出站的代理工具。<br>
 
+VPNGATE 地址：https://www.vpngate.net/ja/
+
 上游仓库地址：https://github.com/baoweise-bot/aimili-vpngate<br>
 
 本仓库fork后自定义修改了大部分代码：<br>
