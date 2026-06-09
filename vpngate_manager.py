@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 import concurrent.futures
+import secrets
 
 def sanitize_openvpn_config(text: str) -> str:
     """
@@ -101,7 +102,7 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "1260"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1260"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
-MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
+MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "1000")) # [优化] 扩大单次拉取上限，尽可能榨干官方 API
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -110,6 +111,19 @@ LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "52928"))
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = int(os.environ.get("UI_PORT", "18658"))
+# 获取公网ip并设置变量
+import urllib.request
+
+def get_public_ip():
+    try:
+        return urllib.request.urlopen(
+            "https://api.ipify.org",
+            timeout=3
+        ).read().decode().strip()
+    except:
+        return ""
+
+PUBLIC_IP = get_public_ip()
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -386,10 +400,21 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
     return cmd
 
 def stop_process(process: subprocess.Popen[str] | None) -> None:
-    if process is None or process.poll() is not None: return
-    process.terminate()
-    try: process.wait(timeout=3)
-    except subprocess.TimeoutExpired: process.kill()
+    if process is None: return
+    
+    # 1. 结束子进程
+    if process.poll() is None:
+        process.terminate()
+        try: process.wait(timeout=3)
+        except subprocess.TimeoutExpired: process.kill()
+        
+    # 2. [修复2] 必须强制关闭 PIPE 管道，防止文件描述符 (FD) 泄露
+    if process.stdout:
+        try: process.stdout.close()
+        except Exception: pass
+    if process.stderr:
+        try: process.stderr.close()
+        except Exception: pass
 
 def kill_existing_openvpn_processes() -> None:
     if not sys.platform.startswith("linux"): return
@@ -468,12 +493,12 @@ def toggle_singbox(enable: bool, proxy_port: int) -> tuple[bool, str]:
         if enable:
             if not sb_bak.exists(): shutil.copy(sb_conf, sb_bak)
             data = json.loads(sb_conf.read_text(encoding="utf-8"))
-            outbounds = [ob for ob in data.get("outbounds", []) if ob.get("tag") != "aimilivpn_socks"]
-            outbounds.insert(0, {"type": "socks", "tag": "aimilivpn_socks", "server": "127.0.0.1", "server_port": proxy_port})
+            outbounds = [ob for ob in data.get("outbounds", []) if ob.get("tag") != "tuzkivpngate_socks"]
+            outbounds.insert(0, {"type": "socks", "tag": "tuzkivpngate_socks", "server": "127.0.0.1", "server_port": proxy_port})
             data["outbounds"] = outbounds
             route = data.get("route", {})
-            rules = [r for r in route.get("rules", []) if r.get("outbound") != "aimilivpn_socks"]
-            rules.insert(0, {"outbound": "aimilivpn_socks"})
+            rules = [r for r in route.get("rules", []) if r.get("outbound") != "tuzkivpngate_socks"]
+            rules.insert(0, {"outbound": "tuzkivpngate_socks"})
             route["rules"] = rules
             data["route"] = route
             sb_conf.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -537,9 +562,36 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         Path(cfg_file).write_text(cfg_text, encoding="utf-8")
     except Exception: return {}
 
-    latency = vpn_utils.ping_latency_ms(h, p, parse_int(node.get("ping")))
+    # ================= [真正的极速且零误杀的快筛逻辑] =================
+    # 强制 fallback 为 0，获取真实的物理连通性
+    actual_latency = vpn_utils.ping_latency_ms(h, p, 0)
+    proto = node.get("proto", "tcp").lower()
+    
+    if actual_latency == 0:
+        if "tcp" in proto:
+            # 确认是 TCP 且物理不通，直接判死刑，安全拦截
+            try: Path(cfg_file).unlink()
+            except Exception: pass
+            with lock:
+                nodes = read_json(NODES_FILE, [])
+                n = next((item for item in nodes if item.get("id") == node_id), None)
+                if n:
+                    n["latency_ms"] = 0
+                    n["probe_status"] = "unavailable"
+                    n["probe_message"] = "TCP Unreachable (Fast Fail)"
+                    write_json(NODES_FILE, sort_all_nodes(nodes))
+                    return n
+            return {}
+        else:
+            # UDP 节点豁免，交由下方 OpenVPN 真实测试
+            # 为保证 UI 不显示 0，调取官方 API 延迟作为兜底显示
+            latency = parse_int(node.get("ping"))
+    else:
+        latency = actual_latency
+    # =================================================================
+
     idx = get_free_test_index()
-    try: ok, message, _ = run_openvpn_until_ready(cfg_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+    try: ok, message, _ = run_openvpn_until_ready(cfg_file, keep_alive=False, route_nopull=True, timeout=6, dev=f"tun{idx}")
     finally:
         release_test_index(idx)
         try: Path(cfg_file).unlink()
@@ -555,42 +607,59 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
 
     with lock:
         nodes = read_json(NODES_FILE, [])
-        node = next((item for item in nodes if item.get("id") == node_id), None)
-        if node:
-            node["latency_ms"] = latency
-            node["probe_status"] = "available" if ok else "unavailable"
-            node["probe_message"] = message
+        n = next((item for item in nodes if item.get("id") == node_id), None)
+        if n:
+            n["latency_ms"] = latency
+            n["probe_status"] = "available" if ok else "unavailable"
+            n["probe_message"] = message
             if ok:
-                node["owner"] = temp_node.get("owner", "")
-                node["asn"] = temp_node.get("asn", "")
-                node["as_name"] = temp_node.get("as_name", "")
-                node["location"] = temp_node.get("location", "")
-                node["ip_type"] = temp_node.get("ip_type", "")
-                node["quality"] = temp_node.get("quality", "")
+                n["owner"] = temp_node.get("owner", "")
+                n["asn"] = temp_node.get("asn", "")
+                n["as_name"] = temp_node.get("as_name", "")
+                n["location"] = temp_node.get("location", "")
+                n["ip_type"] = temp_node.get("ip_type", "")
+                n["quality"] = temp_node.get("quality", "")
             write_json(NODES_FILE, sort_all_nodes(nodes))
-            return next((item for item in nodes if item.get("id") == node_id), node)
+            return next((item for item in nodes if item.get("id") == node_id), n)
         return {}
+
 
 def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     with lock: to_test = [n for n in read_json(NODES_FILE, []) if n.get("id") in node_ids]
+    
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
-        nid = n_info["id"]; cfg_file = n_info["config_file"]; h = str(n_info.get("remote_host") or n_info.get("ip")); p = parse_int(n_info.get("remote_port"))
+        # 统一变量名为 node_id，杜绝歧义
+        node_id = n_info["id"]; cfg_file = n_info["config_file"]; h = str(n_info.get("remote_host") or n_info.get("ip")); p = parse_int(n_info.get("remote_port"))
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
             Path(cfg_file).write_text(n_info.get("config_text") or "", encoding="utf-8")
-        except Exception: return {"id": nid, "probe_status": "unavailable", "latency_ms": 0}
+        except Exception: return {"id": node_id, "probe_status": "unavailable", "latency_ms": 0}
         
-        latency = vpn_utils.ping_latency_ms(h, p, parse_int(n_info.get("ping")))
+        # ================= [批量测试：真正的快筛逻辑] =================
+        actual_latency = vpn_utils.ping_latency_ms(h, p, 0)
+        proto = n_info.get("proto", "tcp").lower()
+        
+        if actual_latency == 0:
+            if "tcp" in proto:
+                try: Path(cfg_file).unlink()
+                except Exception: pass
+                return {"id": node_id, "probe_status": "unavailable", "latency_ms": 0, "probe_message": "TCP Unreachable (Fast Fail)"}
+            else:
+                latency = parse_int(n_info.get("ping"))
+        else:
+            latency = actual_latency
+        # =============================================================
+
         t_idx = get_free_test_index()
-        try: ok, msg, _ = run_openvpn_until_ready(cfg_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{t_idx}")
+        try: ok, msg, _ = run_openvpn_until_ready(cfg_file, keep_alive=False, route_nopull=True, timeout=6, dev=f"tun{t_idx}")
         finally:
             release_test_index(t_idx)
             try: Path(cfg_file).unlink()
             except Exception: pass
             
         return {
-            "id": nid, "latency_ms": latency, "probe_status": "available" if ok else "unavailable", "probe_message": msg,
+            "id": node_id, "latency_ms": latency, "probe_status": "available" if ok else "unavailable", "probe_message": msg,
             "ip": h, "remote_host": h, "remote_port": p,
             "owner": n_info.get("owner", ""), "asn": n_info.get("asn", ""), "as_name": n_info.get("as_name", ""),
             "location": n_info.get("location", ""), "ip_type": n_info.get("ip_type", ""), "quality": n_info.get("quality", "")
@@ -600,9 +669,9 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(15, max(1, len(to_test)))) as executor:
         futs = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for fut in concurrent.futures.as_completed(futs):
-            nid = futs[fut]
-            try: updated[nid] = fut.result()
-            except Exception: updated[nid] = {"id": nid, "probe_status": "unavailable", "latency_ms": 0}
+            curr_id = futs[fut]
+            try: updated[curr_id] = fut.result()
+            except Exception: updated[curr_id] = {"id": curr_id, "probe_status": "unavailable", "latency_ms": 0}
 
     succ = [r for r in updated.values() if r.get("probe_status") == "available"]
     if succ:
@@ -814,14 +883,15 @@ def daily_scheduler_loop() -> None:
             print(f"[定时任务] 自动更新失败: {e}", flush=True)
             time.sleep(60) 
 
-LOGIN_HTML = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>AimiliVPN - 安全登录</title><link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600&display=swap" rel="stylesheet"><style>:root{--bg-dark:#090d16;--bg-surface:rgba(15,23,42,0.45);--text-primary:#f8fafc;--primary:#6366f1;--primary-gradient:linear-gradient(135deg,#6366f1 0%,#4f46e5 100%);--danger:#f43f5e;}body{margin:0;font-family:'Outfit',sans-serif;background-color:var(--bg-dark);height:100vh;display:flex;align-items:center;justify-content:center;}.card{background:var(--bg-surface);border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:40px;width:320px;text-align:center;box-shadow:0 20px 40px rgba(0,0,0,0.3);}.card h2{color:var(--text-primary);margin-top:0;}input{width:100%;height:45px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:0 15px;color:#fff;box-sizing:border-box;margin-bottom:15px;outline:none; transition: all 0.3s;}input:focus{border-color:var(--primary);} /* 修复浏览器自动填充导致的白色背景 */ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus, input:-webkit-autofill:active { -webkit-box-shadow: 0 0 0 30px #1e293b inset !important; -webkit-text-fill-color: #f8fafc !important; transition: background-color 5000s ease-in-out 0s; caret-color: white; } button{width:100%;height:45px;background:var(--primary-gradient);border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer;}.err{color:var(--danger);font-size:13px;display:none;margin-bottom:10px;}</style></head><body><div class="card"><h2>AimiliVPN</h2><form onsubmit="handle(event)"><input type="text" id="u" placeholder="管理账号" required><input type="password" id="p" placeholder="安全密码" required><div id="e" class="err"></div><button type="submit" id="b">登录</button></form></div><script>async function handle(e){e.preventDefault();$("e").style.display="none";$("b").innerText="验证...";try{const r=await fetch("./api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("u").value,password:$("p").value})});const d=await r.json();if(d.ok){$("b").innerText="登录成功，正在跳转...";setTimeout(()=>window.location.reload(),300);}else{$("e").innerText=d.error;$("e").style.display="block";$("b").innerText="登录";}}catch(e){$("e").innerText="网络错误";$("e").style.display="block";$("b").innerText="登录";}}const $=id=>document.getElementById(id);</script></body></html>"""
+LOGIN_HTML = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>TuzkiVpnGate - 安全登录</title><link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600&display=swap" rel="stylesheet"><style>:root{--bg-dark:#090d16;--bg-surface:rgba(15,23,42,0.45);--text-primary:#f8fafc;--primary:#6366f1;--primary-gradient:linear-gradient(135deg,#6366f1 0%,#4f46e5 100%);--danger:#f43f5e;}body{margin:0;font-family:'Outfit',sans-serif;background-color:var(--bg-dark);height:100vh;display:flex;align-items:center;justify-content:center;}.card{background:var(--bg-surface);border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:40px;width:320px;text-align:center;box-shadow:0 20px 40px rgba(0,0,0,0.3);}.card h2{color:var(--text-primary);margin-top:0;}input{width:100%;height:45px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:0 15px;color:#fff;box-sizing:border-box;margin-bottom:15px;outline:none; transition: all 0.3s;}input:focus{border-color:var(--primary);} /* 修复浏览器自动填充导致的白色背景 */ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus, input:-webkit-autofill:active { -webkit-box-shadow: 0 0 0 30px #1e293b inset !important; -webkit-text-fill-color: #f8fafc !important; transition: background-color 5000s ease-in-out 0s; caret-color: white; } button{width:100%;height:45px;background:var(--primary-gradient);border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer;}.err{color:var(--danger);font-size:13px;display:none;margin-bottom:10px;}</style></head><body><div class="card"><h2>TuzkiVpnGate</h2><form onsubmit="handle(event)"><input type="text" id="u" placeholder="管理账号" required><input type="password" id="p" placeholder="安全密码" required><div id="e" class="err"></div><button type="submit" id="b">登录</button></form></div><script>async function handle(e){e.preventDefault();$("e").style.display="none";$("b").innerText="验证...";try{const r=await fetch("./api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("u").value,password:$("p").value})});const d=await r.json();if(d.ok){$("b").innerText="登录成功，正在跳转...";setTimeout(()=>window.location.reload(),300);}else{$("e").innerText=d.error;$("e").style.display="block";$("b").innerText="登录";}}catch(e){$("e").innerText="网络错误";$("e").style.display="block";$("b").innerText="登录";}}const $=id=>document.getElementById(id);</script></body></html>"""
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AimiliVPN 节点管理</title>
+  <title>兔斯基节点管理</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap');
     :root {
@@ -872,7 +942,7 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1 style="margin: 0;"><a href="https://github.com/HayUnow/aimili-vpngate" target="_blank" style="color: #a5b4fc; text-decoration: none;">AimiliVPN 节点管理</a></h1>
+  <h1 style="margin: 0;"><a href="https://github.com/HayUnow/TuzkiVpnGate" target="_blank" style="color: #a5b4fc; text-decoration: none;">兔斯基节点管理</a></h1>
   <div class="btn-group">
     <button id="singbox_btn" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);" onclick="toggleSingbox()">接管 Sing-box</button>
     <button id="refresh" class="btn-primary" onclick="refreshNodes()">更新节点</button>
@@ -889,7 +959,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
-  <div id="active_node_card"></div>
+  <div id="stats_bar"></div> <div id="active_node_card"></div>
   <section class="toolbar">
     <select id="country_filter"><option value="">所有国家</option></select>
     <select id="ip_type_filter">
@@ -927,7 +997,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="restart_modal" class="modal" style="display:none; align-items:center; justify-content:center;">
   <div class="modal-content" style="text-align:center; max-width:300px;">
     <h3 style="margin-top:0;">系统重启中</h3>
-    <p style="font-size:14px; color:var(--text-secondary);">域名已变更，正在应用 HTTPS 配置...</p>
+    <p style="font-size:14px; color:var(--text-secondary);">域名已变更，正在应用当前设置，请等待</p>
     <div style="font-size:32px; font-weight:bold; color:var(--primary); margin:20px 0;" id="countdown_num">10</div>
     <p style="font-size:12px; color:var(--text-secondary);">倒计时结束后将自动重定向</p>
   </div>
@@ -1020,9 +1090,12 @@ async function saveDomain() {
                 clearInterval(timer);
                 const port = location.port || "18658";
                 if (domain) {
+                    // 绑定了新域名，强制跳转新域名的 HTTPS
                     window.location.href = `https://${domain}:${port}${window.location.pathname}`;
                 } else {
-                    window.location.href = `http://${window.location.hostname}:${port}${window.location.pathname}`;
+                    // 取消绑定域名，使用后端安全下发的公网 IP 回退到 HTTP
+                    const targetHost = d.public_ip ? d.public_ip : window.location.hostname;
+                    window.location.href = `http://${targetHost}:${port}${window.location.pathname}`;
                 }
             }
         }, 1000);
@@ -1059,7 +1132,29 @@ function stableSortNodes() {
 }
 
 function render(){
+  // === 新增：统计横幅渲染逻辑 ===
+  const s = state.node_stats || {total: 0, available: 0, unavailable: 0, not_checked: 0};
+  const lastFetchStr = state.last_fetch_at ? new Date(state.last_fetch_at * 1000).toLocaleString('zh-CN', {hour12: false}) : "未获取";
+  
+  $("stats_bar").innerHTML = `
+    <div style="display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--text-secondary); margin-bottom: 20px; align-items: center; background: var(--bg-surface); padding: 12px 20px; border: 1px solid var(--border-color); border-radius: 12px;">
+      <div style="display:flex; align-items:center; gap: 6px;">
+          <svg style="width:16px;height:16px;color:#a5b4fc" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+          <strong>节点统计</strong>
+      </div>
+      <div class="badge" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);">总共: <span style="margin-left:4px;color:#f8fafc;">${s.total}</span></div>
+      <div class="badge" style="background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); color:#34d399;">可用: <span style="margin-left:4px;">${s.available}</span></div>
+      <div class="badge" style="background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.2); color:#fbbf24;">待测: <span style="margin-left:4px;">${s.not_checked}</span></div>
+      <div class="badge" style="background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); color:#fb7185;">不可用(已隐藏): <span style="margin-left:4px;">${s.unavailable}</span></div>
+      <div style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px;">
+          🔄 最近更新: <strong style="color:#a5b4fc;">${lastFetchStr}</strong>
+      </div>
+    </div>
+  `;
+  // ================================
+
   const activeId = state.active_openvpn_node_id;
+  // ... 下面保持原有的代码不变
   const activeNode = nodes.find(n => n.id === activeId);
   
   let backupHtml = "";
@@ -1106,7 +1201,7 @@ function render(){
           正在批量处理节点信息
         </div>
         <div style="color: var(--text-secondary); font-size: 15px; text-align: center;">
-          后台正在为您测速并筛选优质节点，约 1-5 分钟，请耐心等待！<br>
+          后台正在为您加速批量检测并筛选优质节点，约 1-5 分钟，请耐心等待！<br>
           <div style="margin-top: 12px; display: inline-block; padding: 4px 16px; background: rgba(0,0,0,0.2); border-radius: 20px; font-family: 'JetBrains Mono', monospace; font-size: 13px;">
             ⏱️ 已经耗时: <span id="loading_timer" style="color: #f59e0b; font-weight: bold; font-size: 14px;">00:00:00</span>
           </div>
@@ -1118,7 +1213,7 @@ function render(){
     loadingStartTime = null; 
     $("active_node_card").innerHTML = `
       <div class="active-card" style="display: flex; justify-content: center; align-items: center; padding: 30px; opacity: 0.8;">
-        <span style="font-size: 16px; color: var(--text-secondary);">未连接，请在下方列表选择可用节点切换。</span>
+        <span style="font-size: 16px; color: #fbbf24;font-weight: 600;">🟡未连接，请在下方列表选择可用节点切换。</span>
       </div>`;
   }
 
@@ -1375,6 +1470,12 @@ def active_node_pinger() -> None:
         time.sleep(30) 
 
 class Handler(BaseHTTPRequestHandler):
+    
+    timeout = 8.0  # [修复1] 强制设置 Socket 超时，阻断 TLS 嗅探导致的无限挂起死锁
+    # [新增安全] 抹除响应头中的 Python 和 BaseHTTP 版本指纹
+    server_version = "TuzkiSec/1.0"
+    sys_version = ""
+
     def get_secret_path(self) -> str: return load_ui_config().get("secret_path", "EJsW2EepxyBo9lY")
 
     def check_domain_binding(self) -> bool:
@@ -1428,6 +1529,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if not self.check_domain_binding(): return # 新增拦截（检测域名和ip）
+        # === [新增：优先处理图标，避开安全路径拦截] ===
+        if self.path == "/favicon.ico":
+            icon_path = ROOT_DIR / "favicon.ico"
+            if icon_path.exists():
+                with open(icon_path, "rb") as f:
+                    self.send_bytes(f.read(), "image/x-icon")
+                return
+            else:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                return
+        # ==========================================
         path = self.validate_path()
         if not path: return
         if not self.is_authorized():
@@ -1438,10 +1551,29 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"): self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html")
         elif path == "/api/nodes":
             nodes = read_json(NODES_FILE, [])
-            for n in nodes: n["active"] = (n.get("id") == active_openvpn_node_id)
-            self.send_json({"nodes": [{k: v for k, v in n.items() if k != "config_text"} for n in nodes], "state": get_state()})            
+            display_nodes = []
+            
+            # === [新增] 全局节点盘点统计 ===
+            stats = {"total": len(nodes), "available": 0, "unavailable": 0, "not_checked": 0}
+            
+            for n in nodes: 
+                n["active"] = (n.get("id") == active_openvpn_node_id)
+                
+                # 统计状态数量
+                st = n.get("probe_status")
+                if st == "available": stats["available"] += 1
+                elif st == "unavailable": stats["unavailable"] += 1
+                else: stats["not_checked"] += 1
+                
+                # 前端隐身核心逻辑：下发有效节点
+                if st != "unavailable" or n["active"]:
+                    display_nodes.append({k: v for k, v in n.items() if k != "config_text"})
+                    
+            curr_state = get_state()
+            curr_state["node_stats"] = stats # 将盘点结果注入到 state 返回给前端
+            
+            self.send_json({"nodes": display_nodes, "state": curr_state})            
         else: self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-       
 
     def do_POST(self) -> None:
         if not self.check_domain_binding(): return # 新增拦截（检测域名和ip）
@@ -1494,7 +1626,7 @@ class Handler(BaseHTTPRequestHandler):
                     for k in expired_tokens:
                         del active_sessions[k]
                     # -----------------------------------------------------------------------    
-                    token = uuid.uuid4().hex
+                    token = secrets.token_hex(32)
                     active_sessions[token] = {"expires": time.time() + 3600}
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -1535,9 +1667,14 @@ class Handler(BaseHTTPRequestHandler):
                 # 如果域名发生改变，触发系统重启以便重新加载对应域名的证书
                 if old_domain != clean_domain:
                     threading.Thread(target=lambda: (time.sleep(1), os._exit(0)), daemon=True).start()
-                    self.send_json({"ok": True, "message": f"域名 [{clean_domain}] 绑定成功！系统正在重启以挂载 HTTPS 证书，请3秒后刷新页面。"})
+                    # [新增] 仅在经过 Auth 授权的接口中下发真实服务器 IP
+                    self.send_json({
+                        "ok": True, 
+                        "message": f"域名设置已应用！系统正在重启以挂载网络配置，请等待倒计时跳转。",
+                        "public_ip": PUBLIC_IP
+                    })
                 else:
-                    self.send_json({"ok": True, "message": f"域名 [{clean_domain}] 已保存！"})
+                    self.send_json({"ok": True, "message": f"域名 [{clean_domain}] 已保存！", "public_ip": PUBLIC_IP})
             # ----------------------------------------------    
             elif path == "/api/ignore_domain_warning":
                 cfg = load_ui_config()
@@ -1584,12 +1721,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
             elif path == "/api/disconnect":
                 def do_disconnect():
+                    # [修复]：彻底持久化关闭连接意愿，防止后台维护线程将其视为意外掉线而自动重连
+                    cfg = load_ui_config()
+                    cfg["connection_enabled"] = False
+                    (DATA_DIR / "ui_auth.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                    
                     stop_active_openvpn()
                     with lock:
                         nodes = read_json(NODES_FILE, [])
                         for item in nodes: item["active"] = False
                         write_json(NODES_FILE, nodes)
-                    set_state(active_openvpn_node_id="", last_check_message="手动断开", connected_at=0)
+                    set_state(active_openvpn_node_id="", last_check_message="已手动断开，停止自动连接", connected_at=0)
                 threading.Thread(target=do_disconnect, daemon=True).start()
                 self.send_json({"ok": True})
             elif path == "/api/connect":

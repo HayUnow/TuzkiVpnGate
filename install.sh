@@ -43,7 +43,7 @@ case "$OS_TYPE" in
 esac
 
 echo -e "${BLUE}==========================================================${PLAIN}"
-echo -e "${BLUE}        欢迎使用 AimiliVPN 本地私有化部署脚本${PLAIN}"
+echo -e "${BLUE}        欢迎使用 TuzkiVpnGate 本地私有化部署脚本${PLAIN}"
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
@@ -73,9 +73,9 @@ fi
 # 5. Configure Service
 echo -e "\n${YELLOW}[3/4] 正在配置系统服务...${PLAIN}"
 if command -v systemctl >/dev/null 2>&1; then
-    cat > /lib/systemd/system/aimilivpn.service <<EOF
+    cat > /lib/systemd/system/tuzkivpngate.service <<EOF
 [Unit]
-Description=AimiliVPN OpenVPN Manager with HTTP/SOCKS5 Proxy
+Description=TuzkiVpnGate OpenVPN Manager with HTTP/SOCKS5 Proxy
 After=network.target
 
 [Service]
@@ -84,36 +84,36 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=/usr/bin/python3 vpngate_manager.py
 Restart=always
 RestartSec=5
-EnvironmentFile=-/etc/default/aimilivpn
+EnvironmentFile=-/etc/default/tuzkivpngate
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable aimilivpn.service
+    systemctl enable tuzkivpngate.service
 elif command -v rc-service >/dev/null 2>&1; then
-    cat > /etc/init.d/aimilivpn <<EOF
+    cat > /etc/init.d/tuzkivpngate <<EOF
 #!/sbin/openrc-run
 
-description="AimiliVPN OpenVPN Manager with HTTP/SOCKS5 Proxy"
+description="TuzkiVpnGate OpenVPN Manager with HTTP/SOCKS5 Proxy"
 command="/usr/bin/python3"
 command_args="${INSTALL_DIR}/vpngate_manager.py"
 command_background="yes"
 directory="${INSTALL_DIR}"
-pidfile="/run/aimilivpn.pid"
+pidfile="/run/tuzkivpngate.pid"
 
 depend() {
     need net
     after firewall
 }
 EOF
-    chmod +x /etc/init.d/aimilivpn
-    rc-update add aimilivpn default
+    chmod +x /etc/init.d/tuzkivpngate
+    rc-update add tuzkivpngate default
 fi
 
-# 6. Configure global command shortcut "ml"
-echo -e "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'ml'...${PLAIN}"
-cat > /usr/bin/ml <<'EOF'
+# 6. Configure global command shortcut "tz"
+echo -e "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'tz'...${PLAIN}"
+cat > /usr/bin/tz <<'EOF'
 #!/usr/bin/env python3
 import sys
 import os
@@ -242,7 +242,7 @@ def check_port_listening(port):
             pass
     return False
 
-def get_service_pid(service_name="aimilivpn.service"):
+def get_service_pid(service_name="tuzkivpngate.service"):
     try:
         for pid_dir in os.listdir('/proc'):
             if pid_dir.isdigit():
@@ -257,7 +257,7 @@ def get_service_pid(service_name="aimilivpn.service"):
         pass
     return None
 
-def check_service_active(service_name="aimilivpn.service"):
+def check_service_active(service_name="tuzkivpngate.service"):
     return get_service_pid(service_name) is not None
 
 def check_openvpn_process():
@@ -305,9 +305,9 @@ def print_status():
     is_connecting = state.get("is_connecting", False)
     
     gateway_ok = check_port_listening(proxy_port)
-    service_ok = check_service_active("aimilivpn.service")
+    service_ok = check_service_active("tuzkivpngate.service")
     openvpn_ok = check_openvpn_process()
-    pid = get_service_pid("aimilivpn.service")
+    pid = get_service_pid("tuzkivpngate.service")
     
     active_ip, active_loc = get_active_node_info()
     latency = state.get("active_node_latency", "测试中...") if active_ip else "无活动连接"
@@ -328,7 +328,7 @@ def print_status():
         openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
     
     print_line("=======================================================")
-    print_line(f"               {bold}AimiliVPN 管理终端 v2.0{reset}                  ")
+    print_line(f"               {bold}TuzkiVpnGate 管理终端 v2.0{reset}                  ")
     print_line("=======================================================")
     print_line("【核心服务状态】")
     print_line(format_line(f"代理网关 (Port {proxy_port})", gateway_status))
@@ -337,17 +337,23 @@ def print_status():
     # 在这个位置插入域名绑定状态提示：
     bound = cfg.get("bound_domain", "")
     if bound:
+        # 如果绑定了域名，只显示 HTTPS 安全访问地址
         print_line(format_line("面板域名 (防IP扫描)", f"{green}{bound}{reset}"))
-    host_cfg = cfg.get("host", "::")
-    if host_cfg in ("127.0.0.1", "localhost"):
-        login_ip = "127.0.0.1"
-    elif host_cfg == "::1":
-        login_ip = "[::1]"
-    elif host_cfg == "::":
-        login_ip = get_public_ip()
+        print_line(format_line("安全访问地址", f"{yellow}https://{bound}:{ui_port}/{secret_path}/{reset}"))
     else:
-        login_ip = f"[{host_cfg}]" if ":" in host_cfg else host_cfg
-    print_line(format_line("网页登录地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}"))
+        # 否则（未绑定域名），才去计算并显示 HTTP 的 IP 访问地址
+        host_cfg = cfg.get("host", "::")
+        if host_cfg in ("127.0.0.1", "localhost"):
+            login_ip = "127.0.0.1"
+        elif host_cfg == "::1":
+            login_ip = "[::1]"
+        elif host_cfg == "::":
+            login_ip = get_public_ip()
+        else:
+            login_ip = f"[{host_cfg}]" if ":" in host_cfg else host_cfg
+            
+        print_line(format_line("网页登录地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}"))
+
     print_line(format_line("网页管理账号", cfg.get("username", "未配置")))
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
@@ -365,12 +371,6 @@ def print_status():
         print_line(format_line("节点 IP (入口)", active_ip))
         print_line(format_line("节点地区", active_loc))
         print_line(format_line("节点延迟 (直连测试)", latency))
-        if proxy_ok and proxy_ip and proxy_ip != "-":
-            print_line(format_line("出口 IP (出站)", proxy_ip))
-            print_line(format_line("本地代理延迟", f"{proxy_latency} ms" if proxy_latency else "检测中..."))
-        else:
-            proxy_err = state.get("proxy_error") or "检测中/未就绪"
-            print_line(format_line("出口 IP (出站)", f"{red}[不可用 - {proxy_err}]{reset}"))
     else:
         print_line(format_line("节点状态", "无活动连接"))
     print_line()
@@ -398,32 +398,32 @@ def print_status():
 
 def run_service_cmd(cmd):
     if shutil.which("systemctl"):
-        subprocess.run(["systemctl", cmd, "aimilivpn.service"])
+        subprocess.run(["systemctl", cmd, "tuzkivpngate.service"])
     elif shutil.which("rc-service"):
-        subprocess.run(["rc-service", "aimilivpn", cmd])
+        subprocess.run(["rc-service", "tuzkivpngate", cmd])
     else:
         print("未检测到支持的服务管理器 (systemd/OpenRC)")
 
 def start_service():
-    print("正在启动 AimiliVPN 服务...", flush=True)
+    print("正在启动 TuzkiVpnGate 服务...", flush=True)
     run_service_cmd("start")
     print("已发送启动指令。")
     time.sleep(1)
 
 def stop_service():
-    print("正在停止 AimiliVPN 服务...", flush=True)
+    print("正在停止 TuzkiVpnGate 服务...", flush=True)
     run_service_cmd("stop")
     print("已发送停止指令。")
     time.sleep(1)
 
 def restart_service():
-    print("正在重启 AimiliVPN 服务...", flush=True)
+    print("正在重启 TuzkiVpnGate 服务...", flush=True)
     run_service_cmd("restart")
     print("已发送重启指令。")
     time.sleep(1)
 
 def show_logs():
-    print("正在查看 AimiliVPN 日志 (按 Ctrl+C 退出)...", flush=True)
+    print("正在查看 TuzkiVpnGate 日志 (按 Ctrl+C 退出)...", flush=True)
     if os.path.exists(LOG_FILE):
         try:
             subprocess.run(["tail", "-f", "-n", "50", LOG_FILE])
@@ -434,28 +434,28 @@ def show_logs():
         time.sleep(2)
 
 def uninstall_service():
-    confirm = input("确定要完全卸载 AimiliVPN 吗？(y/N): ")
+    confirm = input("确定要完全卸载 TuzkiVpnGate 吗？(y/N): ")
     if confirm.lower() == 'y':
-        print("正在完全卸载 AimiliVPN...", flush=True)
+        print("正在完全卸载 TuzkiVpnGate...", flush=True)
         stop_service()
         if shutil.which("systemctl"):
-            subprocess.run(["systemctl", "disable", "aimilivpn.service"])
+            subprocess.run(["systemctl", "disable", "tuzkivpngate.service"])
             try:
-                os.unlink("/lib/systemd/system/aimilivpn.service")
+                os.unlink("/lib/systemd/system/tuzkivpngate.service")
             except Exception:
                 pass
         elif shutil.which("rc-service"):
-            subprocess.run(["rc-update", "del", "aimilivpn"])
+            subprocess.run(["rc-update", "del", "tuzkivpngate"])
             try:
-                os.unlink("/etc/init.d/aimilivpn")
+                os.unlink("/etc/init.d/tuzkivpngate")
             except Exception:
                 pass
         try:
-            os.unlink("/usr/bin/ml")
+            os.unlink("/usr/bin/tz")
         except Exception:
             pass
         subprocess.run(["rm", "-rf", INSTALL_DIR])
-        print("AimiliVPN 已卸载！")
+        print("TuzkiVpnGate 已卸载！")
         sys.exit(0)
     else:
         print("已取消卸载。")
@@ -464,7 +464,7 @@ def uninstall_service():
 def ask_restart():
     ans = input("配置已保存。是否立即重启服务生效？(Y/n): ").strip().lower()
     if ans in ('', 'y', 'yes'):
-        print("正在重启 AimiliVPN 服务...", flush=True)
+        print("正在重启 TuzkiVpnGate 服务...", flush=True)
         restart_service()
         print("服务已重启。")
         time.sleep(1.5)
@@ -683,14 +683,14 @@ def main():
         sys.exit(0)
         
     options = {
-        '1': ("启动服务 (ml start)", start_service),
-        '2': ("停止服务 (ml stop)", stop_service),
-        '3': ("重启服务 (ml restart)", restart_service),
-        '4': ("日志监控 (ml logs)", show_logs),
-        '5': ("网页配置 (ml web)", configure_web),
-        '6': ("端口配置 (ml port)", configure_port),
-        '7': ("账号密码 (ml password)", configure_credentials),
-        '8': ("完全卸载 (ml uninstall)", uninstall_service),
+        '1': ("启动服务 (tz start)", start_service),
+        '2': ("停止服务 (tz stop)", stop_service),
+        '3': ("重启服务 (tz restart)", restart_service),
+        '4': ("日志监控 (tz logs)", show_logs),
+        '5': ("网页配置 (tz web)", configure_web),
+        '6': ("端口配置 (tz port)", configure_port),
+        '7': ("账号密码 (tz password)", configure_credentials),
+        '8': ("完全卸载 (tz uninstall)", uninstall_service),
         '0': ("退出终端", None)
     }
     
@@ -753,8 +753,8 @@ if __name__ == "__main__":
     main()
 EOF
 
-sed -i "s|MY_INSTALL_DIR_PLACEHOLDER|${INSTALL_DIR}|g" /usr/bin/ml
-chmod +x /usr/bin/ml
+sed -i "s|MY_INSTALL_DIR_PLACEHOLDER|${INSTALL_DIR}|g" /usr/bin/tz
+chmod +x /usr/bin/tz
 
 # 7. Configure Custom parameters (First-time installation check)
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
@@ -811,11 +811,11 @@ fi
 # 8. Start service & network parameters
 echo -e "\n正在优化网络参数 (配置反向路径过滤 rp_filter=2 以支持策略路由)..."
 if [ -d "/etc/sysctl.d" ]; then
-    cat > /etc/sysctl.d/99-aimilivpn.conf <<EOF
+    cat > /etc/sysctl.d/99-tuzkivpngate.conf <<EOF
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 EOF
-    sysctl -p /etc/sysctl.d/99-aimilivpn.conf >/dev/null 2>&1 || true
+    sysctl -p /etc/sysctl.d/99-tuzkivpngate.conf >/dev/null 2>&1 || true
 else
     if ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.conf; then
         echo "net.ipv4.conf.all.rp_filter = 2" >> /etc/sysctl.conf
@@ -829,14 +829,14 @@ fi
 echo "2" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true
 echo "2" > /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || true
 
-echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
+echo -e "\n正在启动 TuzkiVpnGate 服务并初始化网络..."
 if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart aimilivpn.service || true
+    systemctl restart tuzkivpngate.service || true
 elif command -v rc-service >/dev/null 2>&1; then
-    rc-service aimilivpn restart || true
+    rc-service tuzkivpngate restart || true
 fi
 
-echo -e "\n正在等待 AimiliVPN 首次获取节点并建立加密通道 (此过程可能需要 1-3 分钟，请耐心等待)..."
+echo -e "\n正在等待 TuzkiVpnGate 首次获取节点并建立加密通道 (此过程可能需要 1-3 分钟，请耐心等待)..."
 ACTIVE_ID=""
 for i in {1..90}; do
     if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then
@@ -868,13 +868,13 @@ PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || echo "您的服务器�
 echo -n "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
 
 echo -e "\n${GREEN}==========================================================${PLAIN}"
-echo -e "${GREEN}             AimiliVPN 源码私有化部署已完成！${PLAIN}"
+echo -e "${GREEN}             TuzkiVpnGate 源码私有化部署已完成！${PLAIN}"
 echo -e "${GREEN}==========================================================${PLAIN}"
 echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/${PLAIN}"
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * SOCKS5 代理:   ${BLUE}http://127.0.0.1:52928/${PLAIN}"
 echo -e " --------------------------------------------------------"
-echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
+echo -e "  * 快速状态指令:   ${YELLOW}tz status${PLAIN}  或  ${YELLOW}tz${PLAIN}"
 echo -e "=========================================================="
 echo
