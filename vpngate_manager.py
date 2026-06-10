@@ -138,6 +138,7 @@ failed_logins: dict[str, dict[str, Any]] = {} # [新增] 用于记录登录失�
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 is_connecting = True
+is_csv_fetching = False  # <--- [新增] 专门用于追踪后台是否正在拉取节点
 last_active_ping_time = 0.0
 last_active_latency = 0
 
@@ -281,7 +282,7 @@ def get_state() -> dict[str, Any]:
     
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
-    
+    state["is_background_fetching"] = is_csv_fetching  # <--- [新增] 让前端随时知道后台是不是在拉数据
     ui_cfg = load_ui_config()
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 18658)
@@ -785,10 +786,11 @@ def connect_node(node_id: str) -> str:
     finally:
         with lock: is_connecting = False
 
-def maintain_valid_nodes(force: bool = False) -> str:
-    global is_connecting
+def maintain_valid_nodes(force: bool = False, force_fetch: bool = False) -> str:
+    global is_connecting, is_csv_fetching
     ensure_dirs()
     is_connecting = True
+    is_csv_fetching = True  # <--- [开始] 告诉前端：后台拉取开始了！
     try:
         if force:
             with lock: stop_active_openvpn()
@@ -810,7 +812,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
         try:
             last_fetch_at = get_state().get("last_fetch_at", 0)
             current_nodes_count = len(read_json(NODES_FILE, []))
-            if force or time.time() - last_fetch_at > FETCH_INTERVAL_SECONDS or current_nodes_count < 20:
+            # [核心逻辑] 如果传入了 force_fetch，则无视时间限制，强制获取 API
+            if force or force_fetch or time.time() - last_fetch_at > FETCH_INTERVAL_SECONDS or current_nodes_count < 20:
                 candidates = fetch_candidates()
             else:
                 candidates = []
@@ -847,8 +850,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 auto_switch_node()
         return "Fetch completed"
     except Exception as e:
-        is_connecting = False
         raise e
+    finally:
+        # [结束] 无论成功失败，一定要复位状态
+        is_connecting = False
+        is_csv_fetching = False
 
 def collector_loop() -> None:
     global last_collector_heartbeat
@@ -1205,35 +1211,105 @@ function render(){
   if (activeNode) {
     const backups = nodes.filter(n => n.probe_status === 'available' && !n.active && n.country === activeNode.country).sort((a,b) => (a.latency_ms||999) - (b.latency_ms||999)).slice(0, 3);
     if (backups.length > 0) {
-      backupHtml = `<div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed rgba(255,255,255,0.1); font-size: 13px; color: var(--text-secondary);">
-        <span style="margin-right: 8px;">🛡️ 同地区备选池:</span>
-        ${backups.map(n => `<span class="badge" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); margin-right: 6px;">${esc(n.ip)} (${n.latency_ms}ms)</span>`).join('')}
-      </div>`;
+      backupHtml = `<div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed rgba(255,255,255,0.1); font-size: 13px; color: var(--text-secondary); display: flex; align-items: center;">
+  <span style="
+    margin-right: 12px; 
+    flex-shrink: 0; 
+    color:#67e8f9; 
+    font-weight: 600; 
+    font-size: 16px; /* 重点：调大字号 */
+  ">
+    🛡️ 同地区备选池:
+  </span>
+
+  <div style="display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto;">
+    ${backups.map(n => `
+      <span class="badge" style="
+        background: rgba(103,232,249,0.12);
+        border: 1px solid rgba(103,232,249,0.35);
+        color:#67e8f9;
+        white-space: nowrap;
+      ">
+        ${esc(n.ip)} (${n.latency_ms}ms)
+      </span>
+    `).join('')}
+  </div>
+</div>`;
     } else {
       backupHtml = `<div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed rgba(255,255,255,0.1); font-size: 13px; color: var(--warning);">
-        ⚠️ 警告: 当前地区无可用备选节点，请在下方批量测试补充或开启自动获取
+        ⚠️ 警告: 当前地区无可用备选节点！
       </div>`;
     }
   }
   
   const hasAvailableNodes = nodes.some(n => n.probe_status === 'available');
 
-  if(activeNode) {
-    $("active_node_card").innerHTML = `
-      <div class="active-card">
-        <div style="flex: 1;">
-          <span class="badge available">已连接</span> <strong style="font-size:18px;margin-left:10px;">${esc(activeNode.country)}</strong>
-          <div class="mono" style="margin-top:10px; color:#a5b4fc;">${esc(activeNode.ip||activeNode.remote_host)}:${activeNode.remote_port}</div>
-          ${uptimeHtml}
-          ${backupHtml}
+  const isFetching = state.is_background_fetching;
+  let fetchStatusHtml = "";
+
+  // 1. 顶部中间红色提示文字逻辑
+  if (isFetching) {
+      if (!window.bgFetchStartTime) window.bgFetchStartTime = Date.now();
+      const fetchSecs = Math.floor((Date.now() - window.bgFetchStartTime) / 1000);
+      fetchStatusHtml = `
+        <div style="flex: 2; text-align: center; color: #f43f5e; font-size: 14px; font-weight: 500; padding: 0 15px;">
+          <div>后台正在批量处理刚请求的节点，预计耗时1-5分钟</div>
+          <div style="margin-top: 4px; font-family: 'JetBrains Mono', monospace;">
+            ⏱️ 已经耗时: <span id="loading_timer">${formatUptime(fetchSecs)}</span>
+          </div>
         </div>
-        <button id="btn_disconnect" style="background:var(--danger);color:white;border:none; height: 38px; padding: 0 16px; border-radius: 8px; font-weight: bold; cursor: pointer;" onclick="disconnectNode()">断开连接</button>
+      `;
+  } else {
+      window.bgFetchStartTime = null; 
+      fetchStatusHtml = `<div style="flex: 2;"></div>`; 
+  }
+
+  // 2. 控制右上角“更新节点”按钮的变灰状态
+  const refreshBtn = $("refresh");
+  if (refreshBtn) {
+      if (isFetching) {
+          refreshBtn.innerText = "后台更新中...";
+          refreshBtn.disabled = true;
+          refreshBtn.style.opacity = "0.7";
+          refreshBtn.style.cursor = "not-allowed";
+      } else {
+          refreshBtn.innerText = "更新节点";
+          refreshBtn.disabled = false;
+          refreshBtn.style.opacity = "1";
+          refreshBtn.style.cursor = "pointer";
+      }
+  }
+
+
+// 3. 卡片融合渲染逻辑
+if (activeNode) {
+    $("active_node_card").innerHTML = `
+      <div class="active-card" style="display: flex; flex-direction: column; gap: 12px;">
+        
+        <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+            <div style="flex: 1; min-width: 200px;">
+                <span class="badge available">已连接</span> 
+                <strong style="font-size:18px;margin-left:10px;">${esc(activeNode.country)}</strong>
+                <div class="mono" style="margin-top:6px; color:#a5b4fc;">${esc(activeNode.ip||activeNode.remote_host)}:${activeNode.remote_port}</div>
+                ${uptimeHtml}
+            </div>
+            
+            ${fetchStatusHtml}
+
+            <div style="text-align: right; min-width: 120px;">
+                <button id="btn_disconnect" style="background:var(--danger);color:white;border:none; height: 38px; padding: 0 16px; border-radius: 8px; font-weight: bold; cursor: pointer;" onclick="disconnectNode()">断开连接</button>
+            </div>
+        </div>
+
+        ${backupHtml ? `
+            <div style="border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 12px; width: 100%;">
+                ${backupHtml}
+            </div>` : ''
+        }
+        
       </div>`;
-  } else if (state.is_connecting || !hasAvailableNodes) {
-    if (!loadingStartTime) loadingStartTime = Date.now();
-    
-    // ⬇️ 新增：在每次渲染瞬间，提前计算出当前的真实耗时
-    const currentLoadSecs = Math.floor((Date.now() - loadingStartTime) / 1000);
+} else if (isFetching) {
+    const currentLoadSecs = Math.floor((Date.now() - window.bgFetchStartTime) / 1000);
     const currentLoadTimeStr = formatUptime(currentLoadSecs);
 
     $("active_node_card").innerHTML = `
@@ -1252,7 +1328,6 @@ function render(){
       <style>@keyframes spin { 100% { transform: rotate(360deg); } }</style>
     `;
   } else {
-    loadingStartTime = null; 
     $("active_node_card").innerHTML = `
       <div class="active-card" style="display: flex; justify-content: center; align-items: center; padding: 30px; opacity: 0.8;">
         <span style="font-size: 16px; color: #fbbf24;font-weight: 600;">🟡未连接，请在下方列表选择可用节点切换。</span>
@@ -1289,8 +1364,8 @@ setInterval(() => {
         const upSecs = Math.floor((Date.now() - state.connected_at * 1000) / 1000);
         $("uptime_counter").innerText = formatUptime(upSecs);
     }
-    if (loadingStartTime && $("loading_timer")) {
-        const loadSecs = Math.floor((Date.now() - loadingStartTime) / 1000);
+    if (window.bgFetchStartTime && $("loading_timer")) {
+        const loadSecs = Math.floor((Date.now() - window.bgFetchStartTime) / 1000);
         $("loading_timer").innerText = formatUptime(loadSecs);
     }
 }, 1000);
@@ -1409,10 +1484,12 @@ async function batchTestNodes() {
 }
 
 async function refreshNodes(){
-  $("refresh").innerText="更新中...";
+  $("refresh").innerText="发送请求...";
+  $("refresh").disabled = true;
   userTouchedIpFilter = false; 
   await fetch("./api/refresh_nodes",{method:"POST"});
-  setTimeout(()=>{ $("refresh").innerText="更新节点"; load(); }, 2000);
+  // 请求发出去后立刻加载最新状态，让按钮被 render() 接管变为“后台更新中...”
+  setTimeout(load, 500);
 }
 
 async function toggleSingbox(){
@@ -1814,7 +1891,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
             elif path == "/api/refresh_nodes":
-                threading.Thread(target=maintain_valid_nodes, args=(True,), daemon=True).start()
+                if not is_csv_fetching:
+                    # 传入 force_fetch=True 强制拉新，force=False 保证不断开现有连接
+                    threading.Thread(target=maintain_valid_nodes, kwargs={"force": False, "force_fetch": True}, daemon=True).start()
                 self.send_json({"ok": True})
             elif path == "/api/disconnect":
                 def do_disconnect():
