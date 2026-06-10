@@ -937,7 +937,16 @@ INDEX_HTML = r"""<!doctype html>
     .form-group { margin-bottom: 16px; }
     .form-group label { display: block; font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; }
     .form-group input, .form-group select { width: 100%; box-sizing: border-box; }
-    
+    /* 仅修复“修改管理账号密码”弹窗的自动填充背景色 Bug */
+    #credentials_modal input:-webkit-autofill,
+    #credentials_modal input:-webkit-autofill:hover, 
+    #credentials_modal input:-webkit-autofill:focus, 
+    #credentials_modal input:-webkit-autofill:active {
+      -webkit-box-shadow: 0 0 0 30px #1e293b inset !important;
+      -webkit-text-fill-color: #f8fafc !important;
+      transition: background-color 5000s ease-in-out 0s;
+      caret-color: white;
+    }
   </style>
 </head>
 <body>
@@ -997,7 +1006,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="restart_modal" class="modal" style="display:none; align-items:center; justify-content:center;">
   <div class="modal-content" style="text-align:center; max-width:300px;">
     <h3 style="margin-top:0;">系统重启中</h3>
-    <p style="font-size:14px; color:var(--text-secondary);">域名已变更，正在应用当前设置，请等待</p>
+    <p style="font-size:14px; color:var(--text-secondary);">正在应用当前设置，请等待</p>
     <div style="font-size:32px; font-weight:bold; color:var(--primary); margin:20px 0;" id="countdown_num">10</div>
     <p style="font-size:12px; color:var(--text-secondary);">倒计时结束后将自动重定向</p>
   </div>
@@ -1023,8 +1032,14 @@ INDEX_HTML = r"""<!doctype html>
 <div id="credentials_modal" class="modal">
   <div class="modal-content">
     <h3>修改管理账号密码</h3>
-    <div class="form-group"><label>新管理账号</label><input type="text" id="cred_u"></div>
-    <div class="form-group"><label>新安全密码</label><input type="password" id="cred_p"></div>
+    <div class="form-group">
+      <label>新管理账号</label>
+      <input type="text" id="cred_u" autocomplete="off" placeholder="请输入新账号">
+    </div>
+    <div class="form-group">
+      <label>新安全密码</label>
+      <input type="password" id="cred_p" autocomplete="new-password" placeholder="请输入新密码">
+    </div>
     <div style="text-align: right;"><button onclick="closeModal('credentials_modal')">取消</button> <button class="btn-primary" onclick="saveCreds()">保存</button></div>
   </div>
 </div>
@@ -1036,12 +1051,23 @@ INDEX_HTML = r"""<!doctype html>
     <div class="form-group"><label>登录安全后缀</label><input type="text" id="net_suffix"></div>
     <div class="form-group"><label>本地出站代理端口</label><input type="number" id="net_proxy"></div>
     <div class="form-group"><label>IP 路由模式</label>
-      <select id="net_routing_mode">
+      <select id="net_routing_mode" onchange="toggleCountrySelect()">
         <option value="auto">自动配置 (智能切换最佳IP)</option>
         <option value="fixed_ip">固定 IP (永不自动换 IP)</option>
+        <option value="fixed_region">固定国家 (仅在指定国家内智能切换)</option>
       </select>
     </div>
-    <div style="text-align: right;"><button onclick="closeModal('network_modal')">取消</button> <button class="btn-primary" onclick="saveNetwork()">保存重启</button></div>
+    <div class="form-group" id="group_force_country" style="display: none;">
+      <label>目标国家</label>
+      <select id="net_force_country">
+        <option value="">请选择国家...</option>
+      </select>
+    </div>
+    
+    <div style="text-align: right; margin-top: 20px;">
+      <button onclick="closeModal('network_modal')">取消</button> 
+      <button class="btn-primary" onclick="saveNetwork()">保存重启</button>
+    </div>
   </div>
 </div>
 
@@ -1070,6 +1096,17 @@ function getFilteredNodes() {
     }
     return true;
   });
+}
+
+function toggleCountrySelect() {
+    const mode = $("net_routing_mode").value;
+    $("group_force_country").style.display = mode === "fixed_region" ? "block" : "none";
+    if (mode === "fixed_region") {
+        const uniqueCountries = Array.from(new Set(nodes.map(n => n.country).filter(Boolean))).sort();
+        const curVal = $("net_force_country").value;
+        $("net_force_country").innerHTML = uniqueCountries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+        if (uniqueCountries.includes(curVal)) $("net_force_country").value = curVal;
+    }
 }
 
 async function saveDomain() {
@@ -1194,6 +1231,11 @@ function render(){
       </div>`;
   } else if (state.is_connecting || !hasAvailableNodes) {
     if (!loadingStartTime) loadingStartTime = Date.now();
+    
+    // ⬇️ 新增：在每次渲染瞬间，提前计算出当前的真实耗时
+    const currentLoadSecs = Math.floor((Date.now() - loadingStartTime) / 1000);
+    const currentLoadTimeStr = formatUptime(currentLoadSecs);
+
     $("active_node_card").innerHTML = `
       <div class="active-card" style="display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 35px 20px; border: 2px dashed rgba(99, 102, 241, 0.4); background: rgba(99, 102, 241, 0.05);">
         <div style="font-size: 22px; font-weight: 700; color: #a5b4fc; margin-bottom: 12px; display: flex; align-items: center; gap: 10px;">
@@ -1203,7 +1245,7 @@ function render(){
         <div style="color: var(--text-secondary); font-size: 15px; text-align: center;">
           后台正在为您加速批量检测并筛选优质节点，约 1-5 分钟，请耐心等待！<br>
           <div style="margin-top: 12px; display: inline-block; padding: 4px 16px; background: rgba(0,0,0,0.2); border-radius: 20px; font-family: 'JetBrains Mono', monospace; font-size: 13px;">
-            ⏱️ 已经耗时: <span id="loading_timer" style="color: #f59e0b; font-weight: bold; font-size: 14px;">00:00:00</span>
+            ⏱️ 已经耗时: <span id="loading_timer" style="color: #f59e0b; font-weight: bold; font-size: 14px;">${currentLoadTimeStr}</span>
           </div>
         </div>
       </div>
@@ -1286,7 +1328,18 @@ async function load(){
       if(newOpts.includes(selVal)) $("country_filter").value = selVal;
     }
     
-    $("net_port").value=state.port; $("net_suffix").value=state.secret_path; $("net_proxy").value=state.proxy_port; $("net_routing_mode").value=state.routing_mode;
+    // ⬇️ 修改后（增加 if 判断）：
+    if ($("network_modal").style.display !== "flex") {
+        $("net_port").value=state.port;
+        $("net_suffix").value=state.secret_path; 
+        $("net_proxy").value=state.proxy_port; 
+        $("net_routing_mode").value = state.routing_mode || "auto";
+        if (state.force_country) {
+            $("net_force_country").innerHTML = `<option value="${esc(state.force_country)}">${esc(state.force_country)}</option>`;
+            $("net_force_country").value = state.force_country;
+        }
+        toggleCountrySelect(); // 手动触发一次，以决定是否显示国家选择框
+    }
     
     // [智能过滤逻辑] 如果用户没有手动切换过下拉框，则由系统智能控制
     if (!userTouchedIpFilter && nodes.length > 0) {
@@ -1393,9 +1446,39 @@ async function saveCreds(){
 }
 
 async function saveNetwork(){
-  const payload = { port:$("net_port").value, secret_path:$("net_suffix").value, proxy_port:$("net_proxy").value, routing_mode:$("net_routing_mode").value };
+  const newPort = $("net_port").value; // 提前拿到新端口，避免重载后丢失
+  const payload = { 
+    port: newPort, 
+    secret_path: $("net_suffix").value, 
+    proxy_port: $("net_proxy").value, 
+    routing_mode: $("net_routing_mode").value,
+    force_country: $("net_routing_mode").value === "fixed_region" ? $("net_force_country").value : "" // 提取国家参数
+  };
+  
   const r = await fetch("./api/update_settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-  const d = await r.json(); if(d.ok) { alert(d.message); if(d.restart_needed) setTimeout(()=>window.location.reload(), 3000); closeModal('network_modal'); }
+  const d = await r.json(); 
+  
+  if(d.ok) { 
+    closeModal('network_modal');
+    if(d.restart_needed) {
+      // 唤起 10 秒倒计时弹窗
+      $("restart_modal").style.display = "flex";
+      let count = 10;
+      const numEl = $("countdown_num");
+      numEl.innerText = count;
+      const timer = setInterval(() => {
+          count--;
+          numEl.innerText = count;
+          if (count <= 0) {
+              clearInterval(timer);
+              // 【核心】组合新地址：保持 http/https 协议，保持当前 IP/域名，仅替换为新填写的端口
+              window.location.href = window.location.protocol + "//" + window.location.hostname + ":" + newPort + window.location.pathname;
+          }
+      }, 1000);
+    } else {
+      alert(d.message);
+    }
+  }
 }
 
 async function logoutAdmin(){ await fetch("./api/logout",{method:"POST"}); window.location.reload(); }
@@ -1690,9 +1773,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
             elif path == "/api/update_settings":
                 cfg = load_ui_config()
+                # 【新增】获取修改前的老端口
+                old_proxy_port = parse_int(cfg.get("proxy_port", 52928))
+                # 增加对 routing_mode 和 force_country 的修改检测
                 r_need = (cfg.get("port") != parse_int(payload["port"]) or 
                           cfg.get("secret_path") != payload["secret_path"] or 
                           cfg.get("proxy_port") != parse_int(payload["proxy_port"]) or
+                          cfg.get("routing_mode", "auto") != payload.get("routing_mode", "auto") or
+                          cfg.get("force_country", "") != payload.get("force_country", "") or
                           cfg.get("ssl_cert", "") != payload.get("ssl_cert", "") or
                           cfg.get("ssl_key", "") != payload.get("ssl_key", ""))
                 
@@ -1701,10 +1789,19 @@ class Handler(BaseHTTPRequestHandler):
                     "secret_path": payload["secret_path"], 
                     "proxy_port": parse_int(payload["proxy_port"]), 
                     "routing_mode": payload.get("routing_mode", "auto"),
+                    "force_country": payload.get("force_country", ""),
                     "ssl_cert": payload.get("ssl_cert", "").strip(),
                     "ssl_key": payload.get("ssl_key", "").strip()
                 })
                 (DATA_DIR / "ui_auth.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                # ⬇️ ⬇️ ⬇️ 【新增这段智能同步逻辑】 ⬇️ ⬇️ ⬇️
+                new_proxy_port = parse_int(payload["proxy_port"])
+                if old_proxy_port != new_proxy_port:
+                    # 如果发现修改了端口，且存在 .bak 备份文件（说明当前正在接管状态）
+                    if Path("/etc/sing-box/config.json.bak").exists():
+                        # 自动调用 toggle_singbox，传入最新的端口号进行无缝刷新
+                        toggle_singbox(True, new_proxy_port)
+                # ⬆️ ⬆️ ⬆️ 【新增结束】 ⬆️ ⬆️ ⬆️
                 if r_need: threading.Thread(target=lambda: (time.sleep(1), os._exit(0)), daemon=True).start()
                 self.send_json({"ok": True, "restart_needed": r_need, "message": "保存成功"})
             elif path == "/api/logout":
@@ -1725,7 +1822,13 @@ class Handler(BaseHTTPRequestHandler):
                     cfg = load_ui_config()
                     cfg["connection_enabled"] = False
                     (DATA_DIR / "ui_auth.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-                    
+                    # ⬇️ ⬇️ ⬇️ 【新增：自动恢复 Sing-box 逻辑】 ⬇️ ⬇️ ⬇️
+                    # 如果存在 .bak 备份文件，说明当前正处于接管状态
+                    if Path("/etc/sing-box/config.json.bak").exists():
+                        # 获取当前配置中的端口，调用 toggle_singbox 关闭接管 (False)
+                        proxy_port = parse_int(cfg.get("proxy_port", 52928))
+                        toggle_singbox(False, proxy_port)
+                    # ⬆️ ⬆️ ⬆️ 【新增结束】 ⬆️ ⬆️ ⬆️
                     stop_active_openvpn()
                     with lock:
                         nodes = read_json(NODES_FILE, [])
