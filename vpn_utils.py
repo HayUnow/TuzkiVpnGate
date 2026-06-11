@@ -338,6 +338,12 @@ def load_ip_cache() -> dict[str, dict[str, Any]]:
 def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
     with ip_cache_lock:
         try:
+            # === 新增：写入硬盘前触发清洗逻辑 ===
+            import time
+            now = time.time()
+            # 剔除超过 7 天没被再次激活的陈旧 IP 数据
+            cache = {k: v for k, v in cache.items() if now - v.get("cached_at", 0) < 7 * 24 * 3600}
+            # ==================================
             DATA_DIR.mkdir(exist_ok=True)
             IP_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -412,7 +418,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                     elif item.get("mobile"):
                         quality = "mobile"
 
-                    loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
+                    loc = " ".join(part for part in [item.get("regionName"), item.get("city")] if part)
 
                     new_entries[query_ip] = {
                         "owner": item.get("org") or item.get("isp") or "",
@@ -644,4 +650,4 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
             except Exception:
                 pass
 
-    return None
+    return None

@@ -988,7 +988,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="table-container">
     <table>
       <thead>
-        <tr><th>状态</th><th>延迟</th><th>IP地址:端口</th><th>国家地区</th><th>质量 / ISP</th><th>IP 类型</th><th>操作</th></tr>
+        <tr><th>状态</th><th>延迟</th><th>IP地址:端口</th><th>国家</th><th>地区</th><th>IP 类型</th><th>操作</th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -1219,7 +1219,7 @@ function render(){
     font-weight: 600; 
     font-size: 16px; /* 重点：调大字号 */
   ">
-    🛡️ 同地区备选池:
+    🛡️ 同国家备选池:
   </span>
 
   <div style="display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto;">
@@ -1237,7 +1237,7 @@ function render(){
 </div>`;
     } else {
       backupHtml = `<div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed rgba(255,255,255,0.1); font-size: 13px; color: var(--warning);">
-        ⚠️ 警告: 当前地区无可用备选节点！
+        ⚠️ 警告: 当前国家无可用备选节点！
       </div>`;
     }
   }
@@ -1289,8 +1289,8 @@ if (activeNode) {
         <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
             <div style="flex: 1; min-width: 200px;">
                 <span class="badge available">已连接</span> 
-                <strong style="font-size:18px;margin-left:10px;">${esc(activeNode.country)}</strong>
-                <div class="mono" style="margin-top:6px; color:#a5b4fc;">${esc(activeNode.ip||activeNode.remote_host)}:${activeNode.remote_port}</div>
+                <strong style="font-size:18px;margin-left:10px;">${esc(activeNode.country)}</strong> <span style="font-size: 14px; color: #a5b4fc; font-weight: 500; margin-left: 10px;">${esc(activeNode.location || "")}</span>
+                <div class="mono" style="margin-top:6px; color:#a5b4fc;">${esc(activeNode.ip||activeNode.remote_host)}:${activeNode.remote_port} <span style="margin-left:10px; font-family:'Outfit',sans-serif;  font-weight:600; color:${activeNode.latency_ms>0 && activeNode.latency_ms<150 ? '#34d399' : '#fbbf24'};">${activeNode.latency_ms ? activeNode.latency_ms + ' ms' : ''}</span></div>
                 ${uptimeHtml}
             </div>
             
@@ -1349,7 +1349,7 @@ if (activeNode) {
       <td style="color:${n.latency_ms>0&&n.latency_ms<150?'#34d399':'#fbbf24'};font-weight:600;">${n.latency_ms?n.latency_ms+' ms':'-'}</td>
       <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port}</td>
       <td>${esc(n.country)}</td>
-      <td><span style="font-size:12px;color:var(--text-secondary);">${trQuality(n.quality)}</span> <br> ${esc(n.owner||n.as_name||"-")}</td>
+      <td><span style="color: #a5b4fc; font-size: 13px; font-weight: 500;">${esc(n.location || "-")}</span></td>
       <td><span style="background:rgba(255,255,255,0.05);padding:2px 6px;border-radius:4px;font-size:12px;">${trIpType(n.ip_type)}</span></td>
       <td>
         <button style="border-color:#34d399;color:#34d399;" ${isTesting?'disabled':''} onclick="testNode('${esc(n.id)}', event)">${testBtnText}</button>
