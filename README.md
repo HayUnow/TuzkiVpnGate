@@ -36,7 +36,7 @@ VPNGATE 地址：https://www.vpngate.net/ja/
 ---
 
 <h1 align="center">
- ✨本项目当前版本的所有修改和优化均由 Google Gemini 完成✨ 
+ ✨本项目当前版本的所有修改和优化均由 Gemini 完成✨ 
   <br><br>
 </h1>
 <br>
