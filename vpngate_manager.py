@@ -13,6 +13,13 @@ import socket
 import subprocess
 import threading
 import time
+import ipaddress
+import urllib.request
+import json
+import threading
+import time
+import os
+from pathlib import Path
 import urllib.parse
 import urllib.request
 import shutil
@@ -24,6 +31,130 @@ from pathlib import Path
 from typing import Any
 import concurrent.futures
 import secrets
+
+
+ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+CONFIG_DIR = DATA_DIR / "configs"
+NODES_FILE = DATA_DIR / "nodes.json"
+STATE_FILE = DATA_DIR / "state.json"
+AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
+
+# =================================================================
+# [安全核心] Cloudflare 官方 IP 落盘缓存与智能校验系统
+# =================================================================
+
+# 缓存文件路径（复用您现有的 DATA_DIR）
+CF_CACHE_FILE = DATA_DIR / "cf_ips_cache.json"
+# 缓存有效期：7天 (7 * 24 * 3600 秒)
+CF_CACHE_EXPIRE = 604800 
+# 遇错触发更新的冷却时间：1销售 (3600秒)，防止恶意扫描引发 DoS 攻击
+CF_FETCH_COOLDOWN = 3600  
+
+# 静态兜底 IP (仅在缓存文件损坏且 API 彻底无法访问的极端物理断网情况下使用)
+FALLBACK_CF_IPV4 = ["173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22"]
+FALLBACK_CF_IPV6 = ["2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32"]
+
+cf_lock = threading.Lock()
+
+def fetch_and_cache_cf_ips() -> dict:
+    """从官方获取最新 IP 并直接落盘"""
+    try:
+        # 获取 IPv4
+        req4 = urllib.request.Request("https://www.cloudflare.com/ips-v4", headers={'User-Agent': 'TuzkiManager/2.0'})
+        with urllib.request.urlopen(req4, timeout=8) as response:
+            v4_list = [line.strip() for line in response.read().decode('utf-8').splitlines() if line.strip()]
+        
+        # 获取 IPv6
+        req6 = urllib.request.Request("https://www.cloudflare.com/ips-v6", headers={'User-Agent': 'TuzkiManager/2.0'})
+        with urllib.request.urlopen(req6, timeout=8) as response:
+            v6_list = [line.strip() for line in response.read().decode('utf-8').splitlines() if line.strip()]
+
+        if not v4_list or not v6_list:
+            raise ValueError("Empty data fetched")
+
+        cache_data = {
+            "last_update": time.time(),
+            "ipv4": v4_list,
+            "ipv6": v6_list
+        }
+        
+        # 落盘保存
+        with cf_lock:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            CF_CACHE_FILE.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
+            print(f"[安全网关] 成功从官方同步并落盘最新的 Cloudflare IP 段！", flush=True)
+        return cache_data
+
+    except Exception as e:
+        print(f"[安全网关] 拉取 Cloudflare IP 失败: {e}", flush=True)
+        return {}
+
+def load_cf_cache() -> dict:
+    """读取本地落盘的 JSON 缓存"""
+    with cf_lock:
+        if CF_CACHE_FILE.exists():
+            try:
+                return json.loads(CF_CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+    return {}
+
+def check_ip_in_lists(ip_str: str, v4_list: list, v6_list: list) -> bool:
+    """基础比对逻辑"""
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+        if ip_obj.version == 4:
+            return any(ip_obj in ipaddress.ip_network(net) for net in v4_list)
+        else:
+            return any(ip_obj in ipaddress.ip_network(net) for net in v6_list)
+    except Exception:
+        return False
+
+def is_cloudflare_ip(ip_str: str) -> bool:
+    """智能校验主函数：满足你的【读取->判断->无则拉取->重判】逻辑"""
+    # 【防误杀修复】剥离 Python 双栈网络底层的 IPv4 映射前缀
+    if ip_str.startswith("::ffff:"):
+        ip_str = ip_str.replace("::ffff:", "")
+        
+    now = time.time()
+    cache = load_cf_cache()
+    
+    last_update = cache.get("last_update", 0)
+    v4_list = cache.get("ipv4", FALLBACK_CF_IPV4)
+    v6_list = cache.get("ipv6", FALLBACK_CF_IPV6)
+    
+    # 1. 检查是否超过 7 天自然到期
+    if now - last_update > CF_CACHE_EXPIRE:
+        print("[安全网关] Cloudflare 缓存已超 7 天，触发自然更新...", flush=True)
+        new_cache = fetch_and_cache_cf_ips()
+        if new_cache:
+            v4_list = new_cache.get("ipv4", v4_list)
+            v6_list = new_cache.get("ipv6", v6_list)
+            last_update = new_cache.get("last_update", last_update)
+
+    # 2. 第一次对比：如果 IP 存在于当前缓存，直接放行
+    if check_ip_in_lists(ip_str, v4_list, v6_list):
+        return True
+
+    # 3. 遇错重试逻辑：不在缓存内？检查是否满足冷却时间
+    # 只有距离上次拉取超过 1小时，才允许触发遇错更新，死死防住恶意扫段 DDoS
+    if now - last_update > CF_FETCH_COOLDOWN:
+        print(f"[安全网关] 未知 IP {ip_str} 请求访问，且缓存超 1 小时未更新，触发安全探针拉取最新 IP 段...", flush=True)
+        new_cache = fetch_and_cache_cf_ips()
+        if new_cache:
+            v4_list = new_cache.get("ipv4", v4_list)
+            v6_list = new_cache.get("ipv6", v6_list)
+            # 4. 第二次对比：用刚刚拉取热乎的最新数据重新对比一次
+            if check_ip_in_lists(ip_str, v4_list, v6_list):
+                print(f"[安全网关] 放行：{ip_str} 确认为 CF 新增节点。", flush=True)
+                return True
+            else:
+                print(f"[安全网关] 拦截：更新后 {ip_str} 仍非 CF 官方节点，确认为恶意伪造。", flush=True)
+                return False
+
+    # 如果冷却期没过，或者拉了最新也比对不上，直接判定非法
+    return False
 
 def sanitize_openvpn_config(text: str) -> str:
     """
@@ -124,13 +255,6 @@ def get_public_ip():
         return ""
 
 PUBLIC_IP = get_public_ip()
-
-ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
-CONFIG_DIR = DATA_DIR / "configs"
-NODES_FILE = DATA_DIR / "nodes.json"
-STATE_FILE = DATA_DIR / "state.json"
-AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 
 lock = threading.RLock()
 active_sessions: dict[str, dict[str, Any]] = {}
@@ -238,7 +362,7 @@ def load_ui_config() -> dict[str, Any]:
         config = {
             "username": "", "secret_path": "EJsW2EepxyBo9lY", "password": "", "host": "::", "port": 18658,
             "routing_mode": "auto", "force_country": "", "routing_ip_type": "all", "connection_enabled": True, "fixed_node_id": "",
-            "bound_domain": "", "ignore_domain_warning": False # 新增这两项域名绑定设置
+            "bound_domain": "", "domain_mode": "none", "ignore_domain_warning": False 
         }
         updated = False
         if auth_file.exists():
@@ -293,6 +417,7 @@ def get_state() -> dict[str, Any]:
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["bound_domain"] = ui_cfg.get("bound_domain", "")
+    state["domain_mode"] = ui_cfg.get("domain_mode", "none") # [新增] 输出当前模式给前端
     state["ignore_domain_warning"] = ui_cfg.get("ignore_domain_warning", False)
     
     state["singbox_enabled"] = Path("/etc/sing-box/config.json.bak").exists()
@@ -896,7 +1021,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>兔斯基节点管理</title>
+  <title>兔斯基Gate</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap');
@@ -907,7 +1032,8 @@ INDEX_HTML = r"""<!doctype html>
       --active-row-bg: rgba(16, 185, 129, 0.06);
     }
     body { margin: 0; font-family: 'Outfit', sans-serif; background-color: var(--bg-dark); color: var(--text-primary); min-height: 100vh; }
-    header { padding: 16px 32px; background: rgba(11, 15, 25, 0.7); border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; }
+    header { padding: 16px 32px; background: rgba(11, 15, 25, 0.7); border-bottom: 1px solid var(--border-color); position: sticky; top: 0; z-index: 100; backdrop-filter: blur(10px); }
+    .header-inner { display: flex; justify-content: space-between; align-items: center; width: 100%; max-width: 1400px; margin: 0 auto; }
     h1 { font-size: 20px; font-weight: 700; margin: 0; color: #a5b4fc; }
     .btn-group { display: flex; gap: 12px; align-items: center; }
     button, select, input { height: 38px; border: 1px solid var(--border-color); border-radius: 8px; padding: 0 16px; font-weight: 600; cursor: pointer; background: rgba(255, 255, 255, 0.04); color: var(--text-primary); }
@@ -957,18 +1083,20 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1 style="margin: 0;"><a href="https://github.com/HayUnow/TuzkiVpnGate" target="_blank" style="color: #a5b4fc; text-decoration: none;">兔斯基节点管理</a></h1>
-  <div class="btn-group">
-    <button id="singbox_btn" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);" onclick="toggleSingbox()">接管 Sing-box</button>
-    <button id="refresh" class="btn-primary" onclick="refreshNodes()">更新节点</button>
-    
-    <div class="dropdown">
-      <button id="admin_btn" style="background: rgba(255,255,255,0.08);">管理员设置 ▼</button>
-      <div id="admin_dropdown" class="dropdown-content">
-        <a href="javascript:void(0)" onclick="openModal('credentials_modal')">账号密码设置</a>
-        <a href="javascript:void(0)" onclick="openModal('domain_modal')">绑定域名设置 (安全)</a>
-        <a href="javascript:void(0)" onclick="openModal('network_modal')">代理与网络设置</a>
-        <a href="javascript:void(0)" onclick="logoutAdmin()" style="color: var(--danger);">退出登录</a>
+  <div class="header-inner">
+    <h1 style="margin: 0;"><a href="https://github.com/HayUnow/TuzkiVpnGate" target="_blank" style="color: #a5b4fc; text-decoration: none;">兔斯基Gate</a></h1>
+    <div class="btn-group">
+      <button id="singbox_btn" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);" onclick="toggleSingbox()">接管 Sing-box</button>
+      <button id="refresh" class="btn-primary" onclick="refreshNodes()">更新节点</button>
+      
+      <div class="dropdown">
+        <button id="admin_btn" style="background: rgba(255,255,255,0.08);">管理员设置 ▼</button>
+        <div id="admin_dropdown" class="dropdown-content">
+          <a href="javascript:void(0)" onclick="openModal('credentials_modal')">账号密码设置</a>
+          <a href="javascript:void(0)" onclick="openModal('domain_modal')">绑定域名设置 (安全)</a>
+          <a href="javascript:void(0)" onclick="openModal('network_modal')">代理与网络设置</a>
+          <a href="javascript:void(0)" onclick="logoutAdmin()" style="color: var(--danger);">退出登录</a>
+        </div>
       </div>
     </div>
   </div>
@@ -996,25 +1124,54 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 <div id="domain_modal" class="modal">
   <div class="modal-content">
-    <h3>绑定域名 (防 IP 扫描)</h3>
-    <p style="font-size:13px; color:var(--text-secondary);">绑定域名后，系统将强制校验，彻底禁止通过 IP 访问面板。</p>
-    <div class="form-group">
-        <label>您的域名 (例如: vpn.example.com)</label>
-        <input type="text" id="bind_domain_input" placeholder="留空则不限制 (允许 IP 访问)">
+    <h3>面板安全与代理策略</h3>
+    <p style="font-size:13px; color:var(--text-secondary);">配置访问策略与域名验证，彻底杜绝恶意机器扫描拦截。</p>
+    
+    <div class="form-group" style="margin-top: 15px;">
+        <label>网络安全模式</label>
+        <select id="bind_domain_mode" onchange="toggleDomainInput()" style="width: 100%; height: 42px; border-radius: 8px;">
+            <option value="none">不限制 (允许 IP 直接访问，存在被扫风险)</option>
+            <option value="normal">普通域名绑定 (VPS 本身验证并持有 SSL 证书)</option>
+            <option value="cloudflare">Cloudflare 代理模式 (强校验 CF 节点 IP + 域名回源)</option>
+        </select>
     </div>
-    <div style="text-align: right;">
+
+    <div class="form-group" id="domain_input_group">
+        <label>授权绑定的域名 (例如: vpn.example.com)</label>
+        <input type="text" id="bind_domain_input" placeholder="输入接收流量的域名">
+        
+        <p style="font-size:13px; color:var(--text-secondary); margin-top:8px; line-height:1.5; display:none;" id="normal_hint">
+            💡 <b>提示：</b> 启用后，系统将尝试嗅探 <code>/root/cert/</code> 目录下的同名证书。如果找齐公钥与私钥，面板将自动挂载并升级为本地 HTTPS 直连服务。
+        </p>
+        
+        <p style="font-size:13px; color:var(--warning); margin-top:8px; line-height:1.5; display:none;" id="cf_hint">
+            ⚠️ <b>Cloudflare 回源强校验：</b> 本地 VPS 将<b>保持 HTTP 运行</b>，不挂载任何证书。请确保您已在 Cloudflare 上配置 <b>Origin Rules</b> 将流量转发至本 VPS 端口。启用后，任何非 CF 官方节点的直连请求将被 100% 拦截。
+        </p>
+    </div>
+    <div style="text-align: right; margin-top: 24px;">
         <button onclick="closeModal('domain_modal')">取消</button> 
-        <button class="btn-primary" onclick="saveDomain()">保存</button>
+        <button class="btn-primary" onclick="saveDomain()">保存并重启服务</button>
     </div>
   </div>
 </div>
 
 <div id="restart_modal" class="modal" style="display:none; align-items:center; justify-content:center;">
-  <div class="modal-content" style="text-align:center; max-width:300px;">
+  <div class="modal-content" id="restart_modal_content" style="text-align:center; max-width:300px; transition: max-width 0.3s ease;">
     <h3 style="margin-top:0;">系统重启中</h3>
     <p style="font-size:14px; color:var(--text-secondary);">正在应用当前设置，请等待</p>
     <div style="font-size:32px; font-weight:bold; color:var(--primary); margin:20px 0;" id="countdown_num">10</div>
-    <p style="font-size:12px; color:var(--text-secondary);">倒计时结束后将自动重定向</p>
+    
+    <div id="cf_port_warning" style="display:none; margin-top: 15px; padding: 16px; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; text-align: left; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+        <div style="color: #fbbf24; font-size: 14px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 8px;">
+            <svg style="width:18px;height:18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            Cloudflare 端口同步提醒
+        </div>
+        <div style="color: var(--text-secondary); font-size: 13px; line-height: 1.6;">
+            检测到您修改了接收端口。请务必前往 Cloudflare 控制台，将 <b>Origin Rules (回源规则)</b> 的目标端口同步修改为 <strong id="cf_new_port_display" style="color:#10b981; font-size: 16px; padding: 0 4px;"></strong>，否则倒计时结束后将无法打开网页！
+        </div>
+    </div>
+
+    <p style="font-size:12px; color:var(--text-secondary); margin-top:20px;">倒计时结束后将自动重定向</p>
   </div>
 </div>
 
@@ -1072,7 +1229,7 @@ INDEX_HTML = r"""<!doctype html>
     
     <div style="text-align: right; margin-top: 20px;">
       <button onclick="closeModal('network_modal')">取消</button> 
-      <button class="btn-primary" onclick="saveNetwork()">保存重启</button>
+      <button class="btn-primary" onclick="saveNetwork()">保存并重启服务</button>
     </div>
   </div>
 </div>
@@ -1115,10 +1272,28 @@ function toggleCountrySelect() {
     }
 }
 
+// 动态切换不同模式下的 UI 输入框提示
+function toggleDomainInput() {
+    const mode = $("bind_domain_mode").value;
+    $("domain_input_group").style.display = mode === "none" ? "none" : "block";
+    $("normal_hint").style.display = mode === "normal" ? "block" : "none";
+    $("cf_hint").style.display = mode === "cloudflare" ? "block" : "none";
+}
+
+// 针对不同架构进行精准重定向的全新保存函数
 async function saveDomain() {
-    const domain = $("bind_domain_input").value;
+    const mode = $("bind_domain_mode").value;
+    const domain = $("bind_domain_input").value.trim();
+    
+    if (mode !== "none" && !domain) {
+        alert("启用绑定模式时，域名不能为空！");
+        return;
+    }
+
     const r = await fetch("./api/update_domain", {
-        method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({domain})
+        method:"POST", 
+        headers:{"Content-Type":"application/json"}, 
+        body:JSON.stringify({domain: domain, mode: mode})
     });
     const d = await r.json();
     if (d.ok) {
@@ -1131,12 +1306,18 @@ async function saveDomain() {
             numEl.innerText = count;
             if (count <= 0) {
                 clearInterval(timer);
-                const port = location.port || "18658";
-                if (domain) {
-                    // 绑定了新域名，强制跳转新域名的 HTTPS
+                
+                if (mode === "cloudflare") {
+                    // 【核心区分点】Cloudflare 模式：外部由 CDN 承载 HTTPS (443)，回源转换由 CF 处理。
+                    // 倒计时结束后，清除内部管理端口，直接跳转到标准的 HTTPS 域名地址
+                    window.location.href = `https://${domain}${window.location.pathname}`;
+                } else if (mode === "normal") {
+                    // 普通直连模式：VPS 本地持证，走本地管理端口的强 HTTPS 连接
+                    const port = location.port || "18658";
                     window.location.href = `https://${domain}:${port}${window.location.pathname}`;
                 } else {
-                    // 取消绑定域名，使用后端安全下发的公网 IP 回退到 HTTP
+                    // 不限制模式：回退到直接通过公网 IP + 端口访问
+                    const port = location.port || "18658";
                     const targetHost = d.public_ip ? d.public_ip : window.location.hostname;
                     window.location.href = `http://${targetHost}:${port}${window.location.pathname}`;
                 }
@@ -1377,7 +1558,13 @@ async function load(){
     const r=await fetch("./api/nodes"); const d=await r.json();
     nodes=d.nodes||[]; state=d.state||{};
 
-    $("bind_domain_input").value = state.bound_domain || "";
+    // ▼ 替换成带条件判断的代码 ▼
+    if ($("domain_modal").style.display !== "flex") {
+        $("bind_domain_mode").value = state.domain_mode || "none";
+        $("bind_domain_input").value = state.bound_domain || "";
+        toggleDomainInput(); // 触发一次显示状态刷新
+    }
+    // ▲ 替换结束 ▲
     if (!state.bound_domain && !state.ignore_domain_warning && !warningShown) {
         openModal('domain_warning_modal');
         warningShown = true;
@@ -1523,13 +1710,14 @@ async function saveCreds(){
 }
 
 async function saveNetwork(){
-  const newPort = $("net_port").value; // 提前拿到新端口，避免重载后丢失
+  const newPort = $("net_port").value;
+  const newSuffix = $("net_suffix").value; 
   const payload = { 
     port: newPort, 
-    secret_path: $("net_suffix").value, 
+    secret_path: newSuffix, 
     proxy_port: $("net_proxy").value, 
     routing_mode: $("net_routing_mode").value,
-    force_country: $("net_routing_mode").value === "fixed_region" ? $("net_force_country").value : "" // 提取国家参数
+    force_country: $("net_routing_mode").value === "fixed_region" ? $("net_force_country").value : "" 
   };
   
   const r = await fetch("./api/update_settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
@@ -1538,7 +1726,24 @@ async function saveNetwork(){
   if(d.ok) { 
     closeModal('network_modal');
     if(d.restart_needed) {
-      // 唤起 10 秒倒计时弹窗
+      
+      // ==========================================
+      // 【高颜值 UI 动态逻辑】侦测 CF 模式下的端口变更
+      // ==========================================
+      const mode = state.domain_mode || "none";
+      const oldPort = state.port || 18658;
+      
+      // 如果是 CF 模式，且端口发生了改变
+      if (mode === "cloudflare" && parseInt(newPort) !== parseInt(oldPort)) {
+          $("cf_port_warning").style.display = "block";           // 显示警告卡片
+          $("cf_new_port_display").innerText = newPort;           // 渲染新端口号
+          $("restart_modal_content").style.maxWidth = "420px";    // 弹窗平滑拉宽以容纳文字
+      } else {
+          $("cf_port_warning").style.display = "none";
+          $("restart_modal_content").style.maxWidth = "300px";    // 恢复窄弹窗
+      }
+      // ==========================================
+
       $("restart_modal").style.display = "flex";
       let count = 10;
       const numEl = $("countdown_num");
@@ -1548,13 +1753,23 @@ async function saveNetwork(){
           numEl.innerText = count;
           if (count <= 0) {
               clearInterval(timer);
-              // 【核心】组合新地址：保持 http/https 协议，保持当前 IP/域名，仅替换为新填写的端口
-              window.location.href = window.location.protocol + "//" + window.location.hostname + ":" + newPort + window.location.pathname;
+              
+              const host = window.location.hostname;
+              
+              if (mode === "cloudflare") {
+                  window.location.href = `https://${host}/${newSuffix}/`;
+              } else if (mode === "normal") {
+                  window.location.href = `https://${host}:${newPort}/${newSuffix}/`;
+              } else {
+                  window.location.href = `http://${host}:${newPort}/${newSuffix}/`;
+              }
           }
       }, 1000);
     } else {
       alert(d.message);
     }
+  } else {
+      alert(d.error || "保存失败");
   }
 }
 
@@ -1641,22 +1856,39 @@ class Handler(BaseHTTPRequestHandler):
     def check_domain_binding(self) -> bool:
         cfg = load_ui_config()
         bound_domain = cfg.get("bound_domain", "")
-        if not bound_domain:
+        domain_mode = cfg.get("domain_mode", "none")
+
+        if not bound_domain or domain_mode == "none":
             return True
             
-        # 提取 Host 请求头，剔除端口号
-        host_header = self.headers.get("Host", "")
-        if ":" in host_header:
-            host_header = host_header.rsplit(":", 1)[0]
-        host_header = host_header.strip("[]") # 清除 IPv6 的括号
+        # 提取 Host 请求头，剔除端口号和 IPv6 括号
+        host_header = self.headers.get("Host", "").split(":")[0].strip("[]").lower()
+        client_ip = self.client_address[0]
         
-        # 校验如果不匹配，直接返回 403 拒绝响应
-        if host_header.lower() != bound_domain.lower():
+        # 剥离前缀，还原真实 TCP 连接 IP
+        if client_ip.startswith("::ffff:"):
+            client_ip = client_ip.replace("::ffff:", "")
+        
+        # 1. Cloudflare 代理强校验模式
+        if domain_mode == "cloudflare":
+            if not is_cloudflare_ip(client_ip):
+                # 【新增】打印拦截日志，以后谁被拦截了在 tz logs 里清清楚楚
+                print(f"[安全网关] 强力拦截: 源端 IP [{client_ip}] 非 CF 官方节点，拒绝访问！", flush=True)
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"<h1>403 Forbidden : Access Denied</h1><p>Direct IP access is prohibited. Traffic must route through the authorized Cloudflare network.</p>")
+                return False
+
+        # 2. 校验 Host 域名是否匹配 (不论是普通模式还是 CF 模式，这步必做)
+        if host_header != bound_domain.lower():
+            print(f"[安全网关] 强力拦截: 伪造的 Host 头 [{host_header}]，拒绝访问！", flush=True)
             self.send_response(HTTPStatus.FORBIDDEN)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(b"<h1>403 Forbidden</h1><p>Direct IP access is disabled for security reasons. Please access via the designated domain name.</p>")
+            self.wfile.write(b"<h1>403 Forbidden : Invalid Host</h1><p>The requested host does not match the configured secure domain.</p>")
             return False
+            
         return True
 
     def is_authorized(self) -> bool:
@@ -1751,8 +1983,14 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
             
             if path == "/api/login":
-                # 获取真实的客户端 IP (防代理伪装)
+                # 获取真实的客户端 IP (防代理伪装 + 兼容 CF 代理穿透)
                 client_ip = self.client_address[0]
+                if client_ip.startswith("::ffff:"):
+                    client_ip = client_ip.replace("::ffff:", "")
+                    
+                if is_cloudflare_ip(client_ip) and "CF-Connecting-IP" in self.headers:
+                    client_ip = self.headers.get("CF-Connecting-IP").strip()
+                    
                 username_input = payload.get("username", "")
                 password_input = payload.get("password", "")
                 
@@ -1817,24 +2055,30 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/update_domain":
                 cfg = load_ui_config()
                 raw_domain = payload.get("domain", "").strip()
+                mode = payload.get("mode", "none")
                 clean_domain = raw_domain.replace("https://", "").replace("http://", "")
                 clean_domain = clean_domain.split("/")[0].split(":")[0]
                 
+                if mode == "none":
+                    clean_domain = "" # 如果选了不限制，强制清空域名
+                
                 old_domain = cfg.get("bound_domain", "")
+                old_mode = cfg.get("domain_mode", "none")
+                
                 cfg["bound_domain"] = clean_domain
+                cfg["domain_mode"] = mode
                 (DATA_DIR / "ui_auth.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
                 
-                # 如果域名发生改变，触发系统重启以便重新加载对应域名的证书
-                if old_domain != clean_domain:
+                # 如果域名或模式发生改变，触发系统重启以便重新加载对应网络规则
+                if old_domain != clean_domain or old_mode != mode:
                     threading.Thread(target=lambda: (time.sleep(1), os._exit(0)), daemon=True).start()
-                    # [新增] 仅在经过 Auth 授权的接口中下发真实服务器 IP
                     self.send_json({
                         "ok": True, 
-                        "message": f"域名设置已应用！系统正在重启以挂载网络配置，请等待倒计时跳转。",
+                        "message": f"安全策略已应用！系统正在重启以挂载网络配置，请等待倒计时跳转。",
                         "public_ip": PUBLIC_IP
                     })
                 else:
-                    self.send_json({"ok": True, "message": f"域名 [{clean_domain}] 已保存！", "public_ip": PUBLIC_IP})
+                    self.send_json({"ok": True, "message": "安全策略已保存！", "public_ip": PUBLIC_IP})
             # ----------------------------------------------    
             elif path == "/api/ignore_domain_warning":
                 cfg = load_ui_config()
@@ -1927,13 +2171,29 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: self.send_json({"ok": False, "error": "Internal Server Error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
 class Tee:
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, max_bytes: int = 50 * 1024 * 1024): # 默认限制 50MB
         self.file_path = file_path
+        self.max_bytes = max_bytes
         Path(file_path).parent.mkdir(exist_ok=True, parents=True)
         # 使用 'w' 模式，每次启动程序时都会清空原有日志，重新开始记录
         self.file = open(file_path, "w", encoding="utf-8")
         self.stdout = sys.stdout
-        
+
+    def _rotate(self) -> None:
+        """达到大小上限时触发无缝切割轮转，且严格只保留 1 份旧备份"""
+        self.file.close()
+        backup_path = self.file_path + ".bak"
+        import os
+        try:
+            if os.path.exists(self.file_path):
+                # os.replace 是原子操作，如果目标 .bak 存在，会瞬间将其无情覆盖
+                # 这样保证了硬盘里永远只有一份最新的备份，不会占用额外空间
+                os.replace(self.file_path, backup_path)
+        except Exception:
+            pass
+        # 重新创建一个空的当前日志文件接力写入
+        self.file = open(self.file_path, "w", encoding="utf-8")
+
     def write(self, data: str) -> None:
         self.stdout.write(data)
         self.file.write(data)
@@ -1941,7 +2201,10 @@ class Tee:
         if '\n' in data:
             self.file.flush()
             self.stdout.flush()
-            
+            # 写入并刷新后检查大小，利用 tell() 获取字节偏移量，性能极高
+            if self.file.tell() >= self.max_bytes:
+                self._rotate()
+
     def flush(self) -> None: 
         self.stdout.flush()
         self.file.flush()
